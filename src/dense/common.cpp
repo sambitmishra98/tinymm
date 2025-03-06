@@ -60,7 +60,7 @@ void readMTXMatrix(const string &mtx_file, vector<double>& A_data, size_t &m, si
 
 void writeOutputCSV(const FileMetadata &meta, size_t n, size_t m, size_t k, int iterations, double avg_sec, string &vendor, string &device) {
 
-    string output_path = "results/" + vendor + "/" + device + "bench_dense.csv";
+    string output_path = "results/" + vendor + "/" + device + "/bench_dense.csv";
     ofstream output_file(output_path, ios::app);
     if (output_file.tellp() == 0) {output_file << "order,etype,opmat,sparsity,k,n,m,iterations,wtime\n";}
     output_file << meta.order << "," << meta.etype << "," << meta.AMatName << "," << meta.sparsity << "," << k << "," << n << "," << m << "," << iterations << "," << avg_sec << "\n";
