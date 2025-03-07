@@ -3,20 +3,19 @@
 
 #include <string>
 #include <vector>
-#include <cstddef>
+using namespace std;
 
-// Parsed MTX file name, matrices always in "samples/pyfr/mats"
-// ../../samples/pyfr/mats/p<order>/<mesh_type>-<OpMat>-<dims>-<sp/de>.mtx
-struct FileMetadata 
-{
-    std::string order;
-    std::string etype;
-    std::string AMatName;
-    std::string sparsity;
+struct FileMetadata {
+    string order;
+    string etype;
+    string AMatName;
+    string sparsity;
+    int nnz;
 };
 
-FileMetadata parseFilename(const std::string &filename);
-void readMTXMatrix(const std::string &mtx_file, std::vector<double>& A_data, std::size_t &m, std::size_t &k);
-void writeOutputCSV(const FileMetadata &meta, std::size_t n, std::size_t m, std::size_t k, int iterations, double avg_sec, std::string &vendor, std::string &device);
+FileMetadata parseFilename(const string &mtx_file);
+void readMTXMatrix(const string &mtx_file, vector<double>& A_data, size_t &m, size_t &k, FileMetadata &meta);
+void writeOutputCSV(const FileMetadata &meta, size_t n, size_t m, size_t k, int iterations, double avg_sec, string &vendor, string &device);
+void processBandwidthDataFromMatrices(const string &mtx_file, const string &vendor, const string &device);
 
 #endif // COMMON_H
