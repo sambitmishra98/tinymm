@@ -63,23 +63,21 @@ icpx -fsycl -O3 -fsycl-device-code-split=per_source src/dense/mkl-effort.cpp src
 ## Automated Benchmarking
 
 Example setup 
-```bash
-#!/bin/bash
-
-export TINYMM_VENDOR="Intel"
-export TINYMM_DEVICE="MAX1550"
-export TINYMM_BMATRIXLENGTH=1000
+```sh
+export TINYMM_VENDOR="NVIDIA"
+export TINYMM_DEVICE="H100"
+export TINYMM_BMATRIXLENGTH=1000000
 export TINYMM_ITERATIONS=1000
 export TINYMM_ETYPES="hex"  # pri, quad, tet, tri or all
-export TINYMM_ORDERS="all"  # 1–8 or all
+export TINYMM_ORDERS="all"  # 0–8 or all
 
 if [[ "$TINYMM_ETYPES" == "all" ]]; then TINYMM_ETYPES="hex pri quad tet tri"; fi
 if [[ "$TINYMM_ORDERS" == "all" ]]; then TINYMM_ORDERS="0 1 2 3 4 5 6 7 8"; fi
 
 # Fixing vendor selection and module loading
-if   [[ "$TINYMM_VENDOR" == "NVIDIA" ]]; then export TINYMM_BACKEND="cuda"; module load cuda/12.3.0
-elif [[ "$TINYMM_VENDOR" == "AMD"    ]]; then export TINYMM_BACKEND="rocm"; module load rocm/6.3.2 
-elif [[ "$TINYMM_VENDOR" == "Intel"  ]]; then export TINYMM_BACKEND="mkl"; module load intel/oneapi/release/2024.1
+if   [[ "$TINYMM_VENDOR" == "NVIDIA" ]]; then export TINYMM_BE="cuda" ; module load cuda/12.3.0
+elif [[ "$TINYMM_VENDOR" == "AMD"    ]]; then export TINYMM_BE="rocm" ; module load rocm/6.3.2 
+elif [[ "$TINYMM_VENDOR" == "Intel"  ]]; then export TINYMM_BE="mkl"  ; module load intel/oneapi/release/2024.1
 fi
 
 # Ensure results directory exists
@@ -89,14 +87,29 @@ mkdir -p "results/$TINYMM_VENDOR/$TINYMM_DEVICE"
 
 Benchmark dense MM kernels:
 
-```bash
+```sh
 for ORDER in $TINYMM_ORDERS; do
   for ETYPE in $TINYMM_ETYPES; do
     for MATRIX in $(ls samples/pyfr/mats/p${ORDER}/${ETYPE}/); do
       if [[ $MATRIX != *-de.mtx ]]; then continue; fi
       echo "$TINYMM_VENDOR $TINYMM_DEVICE Order:$ORDER Type:$ETYPE Matrix:$MATRIX"
-      ./src/dense/${TINYMM_BACKEND}-minimal.exe samples/pyfr/mats/p${ORDER}/${ETYPE}/$MATRIX $TINYMM_BMATRIXLENGTH $TINYMM_ITERATIONS $TINYMM_VENDOR $TINYMM_DEVICE
-      sleep 1
+      ./src/dense/${TINYMM_BE}-minimal.exe samples/pyfr/mats/p${ORDER}/${ETYPE}/$MATRIX $TINYMM_BMATRIXLENGTH $TINYMM_ITERATIONS $TINYMM_VENDOR $TINYMM_DEVICE
+      sleep 0.1
+    done
+  done
+done
+```
+
+Benchmark sparse MM kernels:
+
+```sh
+for ORDER in $TINYMM_ORDERS; do
+  for ETYPE in $TINYMM_ETYPES; do
+    for MATRIX in $(ls samples/pyfr/mats/p${ORDER}/${ETYPE}/); do
+      if [[ $MATRIX != *-sp.mtx ]]; then continue; fi
+      echo "$TINYMM_VENDOR $TINYMM_DEVICE Order:$ORDER Type:$ETYPE Matrix:$MATRIX"
+      ./src/sparse/${TINYMM_BE}-effort.exe samples/pyfr/mats/p${ORDER}/${ETYPE}/$MATRIX $TINYMM_BMATRIXLENGTH $TINYMM_ITERATIONS $TINYMM_VENDOR $TINYMM_DEVICE
+      sleep 0.1
     done
   done
 done

@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include "common.h"
+#include "src/common.h"
 #include <iostream>
 #include <vector>
 #include <chrono>
@@ -17,7 +17,7 @@ int main(int argc, char* argv[]){
     vector<double> A_data;
     size_t m, k;
 
-    readMTXMatrix(argv[1], A_data, m, k);
+    readMTXMatrix(argv[1], A_data, m, k, meta);
 
     vector<double> B_data(k * n, 1.0); // B is a matrix of all ones
     vector<double> C_data(m * n, 0.0); // C is a matrix of all zeros
