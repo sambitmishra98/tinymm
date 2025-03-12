@@ -18,14 +18,14 @@ tinymm-benchmarking/
 └── src/
     ├── dense/
     │   ├── common.{cpp,h}      # Common utilities (parsing, I/O)
-    │   ├── cuda-effort.cu      # CUDA benchmarks
-    │   └── rocm-minimal.hip    # HIPified CUDA
+    │   ├── cuda/minimal.cu      # CUDA benchmarks
+    │   └── rocm/minimal.hip    # HIPified CUDA
     ├── dense-unrolled/
-    │   └── cuda-effort.cu      # Unrolled CUDA
+    │   └── cuda/minimal.cu      # Unrolled CUDA
     ├── gimmik/
     │   └── pyfr_gimmik_effort.py
     └── sparse/
-        └── cuda-effort.cu
+        └── cuda/minimal.cu
 ```
 
 ### Matrix Filename Convention
@@ -38,24 +38,24 @@ samples/pyfr/mats/p${i}/${etype}/${OPMAT}-${k}x${m}-{sp/de}.mtx
 ### NVIDIA GPUs (CUDA)
 ```bash
 module load cuda/12.3.0
-nvcc src/dense/cuda-effort.cu src/dense/common.cpp -o src/dense/cuda-effort.exe -lcublas
+nvcc src/dense/cuda/minimal.cu src/common.cpp -o src/dense/cuda/minimal.exe -lcublas
 
-./src/dense/cuda-effort.exe samples/pyfr/mats/p0/hex/M0-6x1-sp.mtx 10000000 1000 NVIDIA A100
+./src/dense/cuda/minimal.exe samples/pyfr/mats/p0/hex/M0-6x1-sp.mtx 10000000 1000 NVIDIA A100
 ```
 
 ### AMD GPUs (HIP)
 ```bash
 module load rocm/6.3.2 llvm # llvm for hipify-clang only
-hipify-clang src/dense/cuda-effort.cu -o src/dense/rocm-effort.hip
-hipcc src/dense/rocm-effort.hip src/dense/common.cpp -o src/dense/rocm-effort.exe -lrocblas
+hipify-clang src/dense/cuda/minimal.cu -o src/dense/rocm/minimal.hip
+hipcc src/dense/rocm/minimal.hip src/common.cpp -o src/dense/rocm/minimal.exe -lrocblas
 
-./src/dense/rocm-effort.exe samples/pyfr/mats/p0/hex/M0-6x1-sp.mtx 10000000 1000 AMD MI300x
+./src/dense/rocm/minimal.exe samples/pyfr/mats/p0/hex/M0-6x1-sp.mtx 10000000 1000 AMD MI300x
 ```
 
 ### Intel GPUs (SYCL, oneMKL)
 ```bash
 module load intel/oneapi/release/2024.1
-icpx -fsycl -O3 -fsycl-device-code-split=per_source src/dense/mkl-effort.cpp src/dense/common.cpp -o src/dense/mkl-effort.exe -Wl,--start-group -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential -Wl,--end-group -liomp5 -lpthread -lm
+icpx -fsycl -O3 -fsycl-device-code-split=per_source src/dense/mkl/minimal.cpp src/common.cpp -o src/dense/mkl/minimal.exe -Wl,--start-group -lmkl_sycl -lmkl_intel_lp64 -lmkl_core -lmkl_sequential -Wl,--end-group -liomp5 -lpthread -lm
 
 ./src/dense/mkl_effort.exe samples/pyfr/mats/p3/hex/M0-96x64-de.mtx 100 100 Intel MAX1550
 ```
@@ -108,7 +108,7 @@ for ORDER in $TINYMM_ORDERS; do
     for MATRIX in $(ls samples/pyfr/mats/p${ORDER}/${ETYPE}/); do
       if [[ $MATRIX != *-sp.mtx ]]; then continue; fi
       echo "$TINYMM_VENDOR $TINYMM_DEVICE Order:$ORDER Type:$ETYPE Matrix:$MATRIX"
-      ./src/sparse/${TINYMM_BE}-effort.exe samples/pyfr/mats/p${ORDER}/${ETYPE}/$MATRIX $TINYMM_BMATRIXLENGTH $TINYMM_ITERATIONS $TINYMM_VENDOR $TINYMM_DEVICE
+      ./src/sparse/${TINYMM_BE}-minimal.exe samples/pyfr/mats/p${ORDER}/${ETYPE}/$MATRIX $TINYMM_BMATRIXLENGTH $TINYMM_ITERATIONS $TINYMM_VENDOR $TINYMM_DEVICE
       sleep 0.1
     done
   done

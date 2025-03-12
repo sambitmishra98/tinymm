@@ -49,18 +49,20 @@ int main(int argc, char* argv[]){
     for(int i = 0; i < iterations; i++){
         //   d_C = alpha *   d_A  *  d_B  + beta *  d_C
         // m x n =          m x k * k x n +        m x n
-        cublasDgemm(handle, 
-            CUBLAS_OP_N, CUBLAS_OP_N, 
-            m, n, k, 
-            &alpha, d_A, m, 
-            d_B, k, 
-            &beta, d_C, m);
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, d_A, m, 
+                                                                       d_B, k, 
+                                                                &beta, d_C, m);
     }
 
     cudaDeviceSynchronize();
     auto end = high_resolution_clock::now();
     double total = duration<double>(end - start).count();
     double avg = total / iterations;
+
+    // Print time taken 
+    cout << endl;
+    cout << "Time taken: " << total << "s" << endl;
+
     writeOutputCSV(meta, n, m, k, iterations, avg, vendor, device);
     cublasDestroy(handle);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
