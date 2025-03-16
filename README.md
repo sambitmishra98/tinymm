@@ -1,36 +1,13 @@
-# tinymm-benchmarking
+# Tiny Matrix Multiplication
 
-Benchmarking repository for double-precision GPU matrix multiplication (`C = A × B`) used in PyFR. Targets NVIDIA (cuBLAS), AMD (hipBLAS), and Intel (oneMKL via SYCL) GPUs. Operator matrices (`A`) vary in size (10s–100s), dense or sparse. Operand matrices (`B`) typically range from 10⁶–10⁷ rows.
-
-## Structure
-```
-tinymm-benchmarking/
-├── plots/                 # Visualization scripts/results
-├── tools/                 # Data processing utilities
-├── results/               # Benchmark outputs
-│   ├── AMD/MI300x/bench_dense.csv
-│   ├── Intel/MAX1550/
-│   └── NVIDIA/
-│       ├── A100/bench_dense.csv
-│       └── H100/
-├── samples/               # Input matrices by polynomial order (p${i})
-│   └── pyfr/mats/p${i}/${etype}/${OPMAT}-${k}x${m}-{sp/de}.mtx
-└── src/
-    ├── dense/
-    │   ├── common.{cpp,h}      # Common utilities (parsing, I/O)
-    │   ├── cuda/minimal.cu      # CUDA benchmarks
-    │   └── rocm/minimal.hip    # HIPified CUDA
-    ├── dense-unrolled/
-    │   └── cuda/minimal.cu      # Unrolled CUDA
-    ├── gimmik/
-    │   └── pyfr_gimmik_effort.py
-    └── sparse/
-        └── cuda/minimal.cu
-```
+This repository solely focusses on matrix multiplications of a particular form (`C = A × B`) where operator matrices `A` have 10s to 100s of rows/columns, and operand matrices `B` range from 10⁶–10⁷ rows. 
+Performance of these matrices are benchmarked with vendor-provided libraries on GPUs. 
+The structure of these matrices allows various optimisation techniques to be applied, such as unrolling the operator matrices and cache-blocking etc. 
+Our goal is to strive for maximum possible performance of these specific matrix operations on the GPUs.
 
 ### Matrix Filename Convention
 ```
-samples/pyfr/mats/p${i}/${etype}/${OPMAT}-${k}x${m}-{sp/de}.mtx
+samples/pyfr/mats/p${i}/${etype}/${OPMAT}.mtx
 ```
 
 ## Compilation & Execution
