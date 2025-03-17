@@ -1,6 +1,6 @@
 *[Ee][Ff][Ff][Oo][Rr][Tt]*
 
-*.exe
+src/*.exe
 
 kernels/*
 
