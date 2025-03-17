@@ -1,7 +1,8 @@
 *[Ee][Ff][Ff][Oo][Rr][Tt]*
 
 *.exe
-*.png
+
+kernels/*
 
 *.output
 *.cobaltlog

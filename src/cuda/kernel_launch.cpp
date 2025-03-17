@@ -190,8 +190,7 @@ int main(int argc, char* argv[])
     if (err != cudaSuccess) { std::cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n"; }
 
     double avg = duration<double>(end - start).count() / args.niters;
-    double bw  = processBandwidth(meta, m, k, args.n, avg);
-    writeOutputCSV(args.device, meta, args.n, avg, bw);
+    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
 
     // 9. Cleanup
     cudaFreeDouble(dB);

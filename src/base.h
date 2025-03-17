@@ -57,16 +57,7 @@ void readMTXdense(const std::string &mtx_file,
                   size_t &m, size_t &k,
                   FileMetadata &meta);
 
-// ----------------------------------------------------------
-// 4) Bandwidth & CSV output
-// ----------------------------------------------------------
-
-/**
- * \brief Compute an approximate memory bandwidth metric:
- *        If mmtype == "dense", use (16 * m*k*n) / time
- *        If mmtype == "sparse", use (16 * nnz * n) / time
- */
-double processBandwidth(const FileMetadata &meta,
+double efficiency(const FileMetadata &meta,
                         size_t m, size_t k, size_t n,
                         double avg_sec);
 
@@ -77,7 +68,7 @@ void writeOutputCSV(const std::string &device,
                     const FileMetadata &meta,
                     size_t n,
                     double avg,
-                    double bw);
+                    double eff);
 
 // ----------------------------------------------------------
 // 5) Write a dense matrix C to a .mtx file for debugging

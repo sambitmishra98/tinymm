@@ -20,9 +20,12 @@ def parse_mtx_filename(mtx_file):
     amat = os.path.basename(mtx_file).replace('.mtx', '')
     return order, etype, amat
 
-def compute_bandwidth(nnz, n, avg_sec):
-    bw = 2.0 * 8.0 * nnz * n / avg_sec
-    return bw
+def ideal_performance(m, k, n):
+    bw = 2e12
+    return (8*n*(m+k)/bw)
+
+def compute_efficiency(m, k, n, avg_sec):
+    return ideal_performance(m, n, k)/avg_sec
 
 def main():
     if len(sys.argv) < 6:
@@ -94,7 +97,7 @@ etype = {etype}
         f.write(backend.kernel_src)
         print(f"[INFO] Kernel source written to {f.name}")
 
-    bw = compute_bandwidth(spA.nnz, n, kern.dt)
+    eff = compute_efficiency(m, k, n, avg_sec=kern.dt)
 
     mmtype_final = f"pyfr_{backend_str}_{kname}"
 
@@ -106,7 +109,7 @@ etype = {etype}
     with open(outcsv, "a") as f:
         if write_header:
             f.write("device,mmtype,order,etype,AMatName,AMatSize,nnz,n,avg,BW\n")
-        f.write(f"{device_str},{mmtype_final},{order},{etype},{AName},{m*k},{spA.nnz},{n},{kern.dt:.9f},{bw:.6e}\n")
+        f.write(f"{device_str},{mmtype_final},{order},{etype},{AName},{m*k},{spA.nnz},{n},{kern.dt:.9f},{eff:.4f}\n")
 
     print(f"[INFO] Results appended to {outcsv}")
 

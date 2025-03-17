@@ -61,10 +61,8 @@ int main(int argc, char* argv[])
     }                
     cudaDeviceSynchronize();
     auto end = high_resolution_clock::now();
-
     double avg = duration<double>(end - start).count() / args.niters;
-    double bw  = processBandwidth(meta, m, k, args.n, avg);
-    writeOutputCSV(args.device, meta, args.n, avg, bw);
+    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
 
     // Cleanup
     cublasDestroy(handle);

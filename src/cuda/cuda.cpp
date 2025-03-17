@@ -59,12 +59,8 @@ int main(int argc, char* argv[]){ if (argc < 6) { cerr << "Usage: " << argv[0] <
     }
     cudaDeviceSynchronize();
     auto end = high_resolution_clock::now();
-    double total = duration<double>(end - start).count();
-    double avg = total / niters;
-
-    double bw = processBandwidth(meta, m, k, n, avg);
-
-    writeOutputCSV(device, meta, n, niters, total, bw);
+    double avg = duration<double>(end - start).count() / niters;
+    writeOutputCSV(device, meta, n, niters, avg, efficiency(meta, m, k, n, avg));
 
     cublasDestroy(handle); cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
 

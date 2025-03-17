@@ -182,13 +182,8 @@ int main(int argc, char* argv[])
     }
     cudaDeviceSynchronize();
     auto end = high_resolution_clock::now();
-
-    double total = duration<double>(end - start).count();
-    double avg   = total / args.niters;
-
-    // 11. Bandwidth & CSV
-    double bw = processBandwidth(meta, m, k, args.n, avg);
-    writeOutputCSV(args.device, meta, args.n, avg, bw);
+    double avg = duration<double>(end - start).count() / args.niters;
+    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
 
     // ------ Cleanup ------
     cudaFree(dBuffer);
