@@ -3,7 +3,7 @@
 //      -Wno-deprecated-declarations src/cuda/sparse.cpp src/base.cpp src/cuda/base.cpp 
 //      -x cu 
 //      -o src/cuda/sparse.exe -lcusparse -lcublas
-// ./src/cuda/sparse.exe h100 sparse operators/p3/hex/M0.mtx 1000 100
+// ./src/cuda/sparse.exe h100 sparse operators/p3/hex/M0.mtx 1000000 5
 
 #include <cuda_runtime.h>
 #include <cusparse.h>

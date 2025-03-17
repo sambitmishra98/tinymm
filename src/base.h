@@ -14,6 +14,7 @@ struct FileMetadata {
     std::string order;    // e.g. "3"
     std::string etype;    // e.g. "hex"
     std::string AMatName; // e.g. "M0"
+    int opmatsize = 0; // m*k
     int nnz = 0;          // #nonzeros (updated when reading .mtx)
 };
 

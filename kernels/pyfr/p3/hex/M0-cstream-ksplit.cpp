@@ -2,7 +2,7 @@ inline __device__ double make_zero()
 { return 0; }
 
 __global__ void
-gimmik_mm(const double* __restrict__ b, double* __restrict__ c)
+gimmik_mm_96x64(const double* __restrict__ b, double* __restrict__ c)
 {
     const int n = 1000000;
     const int ldb = 1000000;

@@ -104,7 +104,9 @@ void readMTXdense(const std::string &mtx_file,
     }
     m = static_cast<size_t>(mm);
     k = static_cast<size_t>(kk);
-    meta.nnz = nnz;
+
+    meta.nnz       = nnz;
+    meta.opmatsize = m * k;
 
     // allocate dense array of size m*k, fill with 0
     A_data.assign(m * k, 0.0);
@@ -130,15 +132,13 @@ double processBandwidth(const FileMetadata &meta,
                         double avg_sec)
 {
     double bytes = 0.0;
-    if (meta.mmtype == "dense") {
-        bytes = 16.0 * double(m) * double(k) * double(n); 
-    } else {
-        // e.g., "sparse" => use nnz
-        bytes = 16.0 * double(m) * double(n);
-    }
-    // throughput in bytes/sec
-    double bw = bytes / avg_sec;
-    return bw;
+    if      (meta.mmtype == "dense")  { bytes = 16.0 * double(meta.opmatsize) * double(n); } 
+    else if (meta.mmtype == "sparse") { bytes = 16.0 * double(meta.nnz)       * double(n); }
+    else {
+        std::cerr << "Error: unknown mmtype " << meta.mmtype << "\n";
+        std::exit(1);
+    }                     
+    return bytes / avg_sec;
 }
 
 void writeOutputCSV(const std::string &device,
@@ -156,7 +156,7 @@ void writeOutputCSV(const std::string &device,
 
     // write header if empty
     if (out.tellp() == 0) {
-        out << "device,mmtype,order,etype,AMatName,n,wtime,BW\n";
+        out << "device,mmtype,order,etype,AMatName,AMatSize,AMatnnz,n,wtime,BW\n";
     }
 
     out << device << ","
@@ -164,6 +164,8 @@ void writeOutputCSV(const std::string &device,
         << meta.order << ","
         << meta.etype << ","
         << meta.AMatName << ","
+        << meta.opmatsize << ","
+        << meta.nnz << ","
         << n << ","
         << avg << ","
         << bw << "\n";
