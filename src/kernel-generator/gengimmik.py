@@ -21,11 +21,11 @@ def kernel_generator(mat, dtype, platform, alpha=1.0, beta=0.0, funcn='gimmik_mm
     import warnings
 
     platmap = {
-        'c': CMatMul,
+        'c':           CMatMul,
         'c-omp': COpenMPMatMul,
-        'cuda': CUDAMatMul,
-        'ispc': ISPCMatMul,
-        'hip': HIPMatMul,
+        'cuda':     CUDAMatMul,
+        'ispc':     ISPCMatMul,
+        'hip':       HIPMatMul,
         'opencl': OpenCLMatMul
     }
 
@@ -34,10 +34,10 @@ def kernel_generator(mat, dtype, platform, alpha=1.0, beta=0.0, funcn='gimmik_mm
 
 def main():
     parser = argparse.ArgumentParser(description='Generate GiMMiK kernels, given operator matrix as *.mtx.')
-    parser.add_argument('order', type=int, help='Polynomial order', choices=[0, 1, 2, 3, 4, 5, 6, 7, 8],         default=3)
-    parser.add_argument('etype', type=str, help='Element type'    , choices=['hex'],                             default='hex')
-    parser.add_argument('mat'  , type=str, help='Matrix name'     , choices=['M0', 'M3', 'M6', 'M132', 'M460'],  default='M0')
-    parser.add_argument('be'   , type=str, help='Backend'         , choices=['cuda', 'hip', 'opencl', 'openmp'], default='cuda')
+    parser.add_argument('order', type=int, help='Polynomial order', choices=[0, 1, 2, 3, 4, 5, 6, 7, 8],       )
+    parser.add_argument('etype', type=str, help='Element type'    , choices=['hex'],                           )
+    parser.add_argument('mat'  , type=str, help='Matrix name'     , choices=['M0', 'M3', 'M6', 'M132', 'M460'] )
+    parser.add_argument('be'   , type=str, help='Backend'         , choices=['cuda', 'hip', 'opencl', 'openmp'])
 
     args = parser.parse_args()
     matrix_path = os.path.join("operators/", f"p{args.order}", args.etype, f"{args.mat}.mtx")
@@ -58,10 +58,10 @@ def main():
         kern += 1
 
         # Write kernel to results/kernels/gimmik/
-        out_dir = os.path.join("kernels/gimmik", f"p{args.order}", args.etype)
+        out_dir = os.path.join("kernels/gimmik", args.be, f"p{args.order}", args.etype)
         os.makedirs(out_dir, exist_ok=True)
 
-        out_fname = f"{args.mat}_{args.be}_{kname}.cpp"
+        out_fname = f"{args.mat}_{kname}.cpp"
         out_path = os.path.join(out_dir, out_fname)
 
         with open(out_path, 'w') as f:

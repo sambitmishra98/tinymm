@@ -1,74 +1,110 @@
 #include <CL/sycl.hpp>
 #include <oneapi/mkl.hpp>
-#include "common.h"
 #include <iostream>
 #include <vector>
 #include <chrono>
-#include <cstdlib>
+
+#include "src/base.h"       // parseCmdLineArgs, readMTXdense, etc.
+#include "src/sycl/base.h"  // syclAllocDouble, syclCopyToDevice, etc.
 
 using namespace std;
-using namespace sycl;
-using namespace oneapi;
+using namespace std::chrono;
 
-int main(int argc, char* argv[]) {
-    FileMetadata meta = parseFilename(argv[1]);
-    size_t n = (argc >= 3) ? atoi(argv[2]) : 0;
-    int iterations = atoi(argv[3]);
-    string vendor = argv[4];
-    string device = argv[5];    
+int main(int argc, char* argv[])
+{
+    // 1) Parse command line
+    CmdLineArgs args = parseCmdLineArgs(argc, argv);
+    FileMetadata meta = parseFilename(args.matrixPath);
+    meta.mmtype  = args.mmtype;  // e.g. "dense"
+    meta.backend = "direct";
+    meta.device  = args.device;
 
+    // 2) Read A in row-major from .mtx
     vector<double> A_data;
     size_t m, k;
-    readMTXMatrix(argv[1], A_data, m, k, meta);
-    if(n == 0)
-        n = k;
-    
-    vector<double> B_data(k * n, 1.0);
-    vector<double> C_data(m * n, 0.0);
-    
-    // Create SYCL queue on a GPU device.
-    queue q{gpu_selector_v};
-    
-    // Create SYCL buffers.
-    buffer<double, 1> bufA(A_data.data(), range<1>(A_data.size()));
-    buffer<double, 1> bufB(B_data.data(), range<1>(B_data.size()));
-    buffer<double, 1> bufC(C_data.data(), range<1>(C_data.size()));
-    
-    double alpha = 1.0, beta = 0.0;
-    
-    try {
-        //   d_C = alpha *   d_A  *  d_B  + beta *  d_C
-        // m x n =          m x k * k x n +        m x n
+    // Our updated readMTXdense now stores A_data[row * k + col]
+    readMTXdense(args.matrixPath, A_data, m, k, meta);
 
-        mkl::blas::gemm(q,
-            mkl::transpose::nontrans, mkl::transpose::nontrans,
-            m, n, k, 
-            alpha, bufA, m,
-            bufB, k,
-            beta, bufC, m);
+    // 3) Prepare B, C in row-major
+    //    - B is shape (k × n) => each row has n columns => leading dimension = n
+    //    - C is shape (m × n) => each row has n columns => leading dimension = n
+    vector<double> B_data(k * args.n, 1.0);
+    vector<double> C_data(m * args.n, 0.0);
+
+    // 4) Create SYCL queue (row-major vs. col-major doesn't matter to the queue)
+    sycl::queue q(sycl::gpu_selector_v);
+
+    // 5) Allocate device memory
+    double *dA = syclAllocDouble(q, A_data.size());
+    double *dB = syclAllocDouble(q, B_data.size());
+    double *dC = syclAllocDouble(q, C_data.size());
+
+    // 6) Copy A, B, C to device
+    syclCopyToDevice(q, dA, A_data);
+    syclCopyToDevice(q, dB, B_data);
+    syclCopyToDevice(q, dC, C_data);
+
+    double alpha = 1.0;
+    double beta  = 0.0;
+
+    // 7) Warm-up with oneMKL row-major gemm
+    //    A is (m × k) => ldA = k
+    //    B is (k × n) => ldB = n
+    //    C is (m × n) => ldC = n
+    try {
+        oneapi::mkl::blas::row_major::gemm(
+            q,
+            oneapi::mkl::transpose::nontrans, // A not transposed
+            oneapi::mkl::transpose::nontrans, // B not transposed
+            (int)m, (int)args.n, (int)k,
+            alpha,
+            dA, (int)k,  // leading dimension for A is k
+            dB, (int)args.n, // leading dimension for B is n
+            beta,
+            dC, (int)args.n  // leading dimension for C is n
+        );
         q.wait_and_throw();
-    } catch (const sycl::exception& e) {
-        cerr << "GEMM warm-up exception: " << e.what() << "\n";
+    } catch (sycl::exception const &e) {
+        cerr << "Warm-up GEMM failed: " << e.what() << "\n";
         return 1;
     }
-    
-    auto start_time = chrono::high_resolution_clock::now();
-    for (int i = 0; i < iterations; i++) {
-        //   d_C = alpha *   d_A  *  d_B  + beta *  d_C
-        // m x n =          m x k * k x n +        m x n
-        mkl::blas::gemm(q,
-            mkl::transpose::nontrans, mkl::transpose::nontrans,
-            m, n, k, 
-            alpha, bufA, m,
-            bufB, k,
-            beta, bufC, m);
+
+    // 8) Check correctness vs. row-major reference gemm
+    //    => This function must also call row_major::gemm with (ldA=k, ldB=n, ldC=n)
+    bool ok = checkOneMKLGemmCorrectness(q, m, args.n, k, dA, dB, dC,
+                                         alpha, beta, 1e-6);
+    if (!ok) {
+        cerr << "[Warm-Up] Results do not match reference.\n";
+        return 1;
     }
-    q.wait_and_throw();
-    auto end_time = chrono::high_resolution_clock::now();
-    double total = chrono::duration<double>(end_time - start_time).count();
-    double avg = total / iterations;
-    
-    writeOutputCSV(meta, n, m, k, iterations, avg, vendor, device);
-    
+
+    // 9) Timed loop
+    auto start = high_resolution_clock::now();
+    for(int i = 0; i < args.niters; i++) {
+        oneapi::mkl::blas::row_major::gemm(
+            q,
+            oneapi::mkl::transpose::nontrans,
+            oneapi::mkl::transpose::nontrans,
+            (int)m, (int)args.n, (int)k,
+            alpha,
+            dA, (int)k,
+            dB, (int)args.n,
+            beta,
+            dC, (int)args.n
+        );
+    }
+    q.wait();
+    auto end = high_resolution_clock::now();
+
+    double avg = duration<double>(end - start).count() / args.niters;
+
+    // 10) CSV output
+    writeOutputCSV(meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+
+    // Cleanup
+    syclFreeDouble(q, dA);
+    syclFreeDouble(q, dB);
+    syclFreeDouble(q, dC);
+
     return 0;
 }

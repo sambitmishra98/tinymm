@@ -27,6 +27,7 @@ int main(int argc, char* argv[])
     // 2. Parse metadata from path
     FileMetadata meta = parseFilename(args.matrixPath);
     meta.mmtype = args.mmtype; // e.g. "sparse"
+    meta.backend = "direct";
 
     // 3. Read matrix A in dense form first (so we can do a reference check)
     vector<double> A_data;

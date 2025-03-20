@@ -1,3 +1,5 @@
+// Location: src/base.h
+
 #pragma once
 
 #include <string>
@@ -10,12 +12,16 @@
 
 /// Metadata about the matrix file (order, etype, etc.).
 struct FileMetadata {
-    std::string mmtype;   // "dense" / "sparse" / "kernel" / ...
+    std::string device;   // e.g. "h100"
+    std::string backend;  // e.g. "direct"/"cuda"/"opencl"
+    std::string mmtype;   // "dense" / "sparse" / "bstream" / "bstream-msplit" / "cstream" / "cstream-ksplit"
     std::string order;    // e.g. "3"
     std::string etype;    // e.g. "hex"
     std::string AMatName; // e.g. "M0"
-    int opmatsize = 0; // m*k
+    int m   = 0;
+    int k   = 0;
     int nnz = 0;          // #nonzeros (updated when reading .mtx)
+
 };
 
 /// Encapsulate command line arguments in a single struct.
@@ -64,11 +70,7 @@ double efficiency(const FileMetadata &meta,
 /**
  * \brief Append a line to results/benchmarks.csv with device, mmtype, dims, etc.
  */
-void writeOutputCSV(const std::string &device,
-                    const FileMetadata &meta,
-                    size_t n,
-                    double avg,
-                    double eff);
+void writeOutputCSV(const FileMetadata &meta, size_t n, double avg, double eff);
 
 // ----------------------------------------------------------
 // 5) Write a dense matrix C to a .mtx file for debugging

@@ -4,14 +4,12 @@
 
 import os
 import sys
-import time
 import numpy as np
 from scipy.io import mmread
 
 # PyFR imports
 from pyfr.backends import get_backend
 from pyfr.inifile import Inifile
-
 
 def parse_mtx_filename(mtx_file):
     parts = mtx_file.strip().split('/')
@@ -28,22 +26,14 @@ def compute_efficiency(m, k, n, avg_sec):
     return ideal_performance(m, n, k)/avg_sec
 
 def main():
-    if len(sys.argv) < 6:
+    if len(sys.argv) < 7:
         print(f"Usage: {sys.argv[0]} <device> <matrix.mtx> <n> <iterations>")
         sys.exit(1)
 
-    device_str, mtx_file, n = sys.argv[1], sys.argv[2], int(sys.argv[3]) 
-    kname = sys.argv[4]
-    iterations= sys.argv[5]
-    print(f"[INFO] Device: {device_str}, Matrix: {mtx_file}, n: {n}, kname: {kname} , iterations: {iterations}")
-
-    device_backend_map = {
-        'h100' : 'cuda',
-        'a100' : 'cuda',
-       'mi300x':  'hip',
-       'mi250' :  'hip',
-       'mi100' :  'hip',
-    }
+    device_str, backend_str, mtx_file, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]) 
+    kname = sys.argv[5]
+    iterations= sys.argv[6]
+    print(f"[INFO] Device: {device_str}, Backend: {backend_str}, Matrix: {mtx_file}, n: {n}, kname: {kname} , iterations: {iterations}")
 
     kernel_name_map = {
         'bstream'       :0, 
@@ -52,8 +42,6 @@ def main():
         'cstream-ksplit':3, 
     }
 
-    backend_str = device_backend_map.get(device_str.lower())
-
     order, etype, AName = parse_mtx_filename(mtx_file)
 
     ini = Inifile(f"""
@@ -61,16 +49,21 @@ def main():
 precision    = double
 memory-model = large
 
-[backend-cuda]
-gimmik-nbench = {iterations}
-gimmik-kern   = {kernel_name_map.get(kname)}
-
 [solver]
 order = {order}
 
 [mesh]
 etype = {etype}
     """)
+
+    if backend_str == 'cuda':
+        ini.set('backend-cuda', 'gimmik-nbench', iterations)
+        ini.set('backend-cuda', 'gimmik-kern', kernel_name_map.get(kname))
+    elif backend_str == 'opencl':
+        ini.set('backend-opencl', 'gimmik-nbench', iterations)
+        ini.set('backend-opencl', 'gimmik-kern', kernel_name_map.get(kname))
+    else:
+        raise ValueError(f"Unsupported device: {device_str}")
 
     backend = get_backend(backend_str, cfg=ini)
 
@@ -88,7 +81,7 @@ etype = {etype}
 
     kern = backend.kernel('mul', A_be, B_be, C_be)
 
-    kernel_src_dir = f"kernels/pyfr/p{order}/{etype}/"
+    kernel_src_dir = f"kernels/pyfr/{backend_str}/p{order}/{etype}/"
 
     # Create directory if it doesn't exist
 
@@ -99,7 +92,7 @@ etype = {etype}
 
     eff = compute_efficiency(m, k, n, avg_sec=kern.dt)
 
-    mmtype_final = f"pyfr_{backend_str}_{kname}"
+    mmtype_final = f"pyfr_{kname}"
 
     os.makedirs("results", exist_ok=True)
     outcsv = "results/benchmarks.csv"
@@ -108,8 +101,8 @@ etype = {etype}
 
     with open(outcsv, "a") as f:
         if write_header:
-            f.write("device,mmtype,order,etype,AMatName,AMatSize,nnz,n,avg,BW\n")
-        f.write(f"{device_str},{mmtype_final},{order},{etype},{AName},{m*k},{spA.nnz},{n},{kern.dt:.9f},{eff:.4f}\n")
+            f.write("device,mmtype,order,etype,OpMat,m,k,n,nnz,avg,BW\n")
+        f.write(f"{device_str},{backend_str},{mmtype_final},{order},{etype},{AName},{m},{k},{n},{spA.nnz},{kern.dt:.9f},{eff:.4f}\n")
 
     print(f"[INFO] Results appended to {outcsv}")
 

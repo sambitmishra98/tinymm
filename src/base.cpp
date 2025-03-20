@@ -106,7 +106,8 @@ void readMTXdense(const std::string &mtx_file,
     k = static_cast<size_t>(kk);
 
     meta.nnz       = nnz;
-    meta.opmatsize = m * k;
+    meta.m = m ;
+    meta.k = k;
 
     // allocate dense array of size m*k, fill with 0
     A_data.assign(m * k, 0.0);
@@ -127,41 +128,47 @@ double efficiency(const FileMetadata &meta,
                         size_t m, size_t k, size_t n,
                         double avg_sec)
 {
-    double bw = 2e12; // 2 TB/s
+    double bw ; 
+
+         if (meta.device == "h100")    bw = 2e12;      // NVIDIA H100
+    else if (meta.device == "max1550") bw = 3.2768e12; // Intel MAX GPU
+    else  bw = 0.0; // 1 TB/s
+
+    // Print this 
+    std::cout << "Device: " << meta.device << ", BW: " << bw << " GB/s\n";
 
     return 8 * n * (m + k) /bw/ avg_sec;
 }
 
-void writeOutputCSV(const std::string &device,
-                    const FileMetadata &meta,
-                    size_t n,
-                    double avg,
-                    double eff)
+void writeOutputCSV(const FileMetadata &meta, size_t n, double avg, double eff)
 {
-    std::string outFile = "results/benchmarks.csv";
-    std::ofstream out(outFile, std::ios::app);
-    if (!out) {
-        std::cerr << "Error: cannot open " << outFile << "\n";
-        return;
-    }
+std::string outFile = "results/benchmarks.csv";
+std::ofstream out(outFile, std::ios::app);
+if (!out) {
+std::cerr << "Error: cannot open " << outFile << "\n";
+return;
+}
 
-    // write header if empty
-    if (out.tellp() == 0) {
-        out << "device,mmtype,order,etype,AMatName,AMatSize,AMatnnz,n,wtime,efficiency\n";
-    }
+// Write header if empty
+if (out.tellp() == 0) {
+out << "device,backend,mmtype,order,etype,OpMat,m,k,n,nnz,wtime,efficiency\n";
+}
 
-    out << device << ","
-        << meta.mmtype << ","
-        << meta.order << ","
-        << meta.etype << ","
-        << meta.AMatName << ","
-        << meta.opmatsize << ","
-        << meta.nnz << ","
-        << n << ","
-        << avg << ","
-        << eff << "\n";
+// Now add a line
+out << meta.device << ","
+<< meta.backend << ","
+<< meta.mmtype << ","
+<< meta.order << ","
+<< meta.etype << ","
+<< meta.AMatName << ","
+<< meta.m << ","
+<< meta.k << ","
+<< n << ","
+<< meta.nnz << ","
+<< avg << ","
+<< eff << "\n";
 
-    out.close();
+out.close();
 }
 
 // -------------------------------------------------------------------

@@ -1,3 +1,5 @@
+// Location: src/cuda/dense.cpp
+
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <iostream>
@@ -15,6 +17,8 @@ int main(int argc, char* argv[])
     CmdLineArgs args = parseCmdLineArgs(argc, argv);
     FileMetadata meta = parseFilename(args.matrixPath);
     meta.mmtype = args.mmtype;
+    meta.backend = "direct";
+    meta.device = args.device;
 
     // 3. Read A
     vector<double> A_data; size_t m, k; readMTXdense(args.matrixPath, A_data, m, k, meta);
@@ -62,7 +66,7 @@ int main(int argc, char* argv[])
     cudaDeviceSynchronize();
     auto end = high_resolution_clock::now();
     double avg = duration<double>(end - start).count() / args.niters;
-    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+    writeOutputCSV(meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
 
     // Cleanup
     cublasDestroy(handle);

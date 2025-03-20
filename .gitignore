@@ -4,6 +4,11 @@ src/*.exe
 
 kernels/*
 
+executables/
+executable/
+
 *.output
 *.cobaltlog
 *.error
+
+consolidate.sh

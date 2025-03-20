@@ -1,0 +1,2042 @@
+________________________________________________________________________________
+File-name: src/base.cpp
+--------------------------------------------------------------------------------
+// Location: "src/base.cpp"
+
+#include "src/base.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <cstdlib>
+#include <cmath>
+
+// -------------------------------------------------------------------
+// 1) Parse command line
+// -------------------------------------------------------------------
+CmdLineArgs parseCmdLineArgs(int argc, char* argv[])
+{
+    if (argc < 6) {
+        std::cerr << "Usage: " << argv[0] << " <device> <mmtype> <matrix.mtx> <n> <niters>\n";
+        std::exit(1);
+    }
+    CmdLineArgs args;
+    args.device     = argv[1];           // e.g. "H100"
+    args.mmtype     = argv[2];           // e.g. "dense"
+    args.matrixPath = argv[3];           // e.g. "operators/p3/hex/M0.mtx"
+    args.n          = static_cast<size_t>(std::atoi(argv[4]));
+    args.niters     = std::atoi(argv[5]);
+
+    return args;
+}
+
+// -------------------------------------------------------------------
+// 2) Parse filename -> FileMetadata
+// -------------------------------------------------------------------
+FileMetadata parseFilename(const std::string &mtx_file)
+{
+    // Typical format: "operators/p<order>/<etype>/<AMatName>.mtx"
+    FileMetadata meta;
+
+    // find "operators/p"
+    size_t pos = mtx_file.find("operators/p");
+    if (pos == std::string::npos) {
+        // fallback or error
+        meta.order = "?";
+        meta.etype = "?";
+        meta.AMatName = mtx_file;
+        return meta;
+    }
+    // skip "operators/p"
+    pos += 11;
+    // next char is polynomial order
+    meta.order = mtx_file.substr(pos, 1);
+
+    // read up to next slash for etype
+    size_t slashPos = mtx_file.find('/', pos);
+    if (slashPos == std::string::npos) {
+        meta.etype = "?";
+        meta.AMatName = mtx_file;
+        return meta;
+    }
+    // e.g. "hex"
+    meta.etype = mtx_file.substr(slashPos + 1, 4);
+    // remove trailing '/' if any
+    if (!meta.etype.empty() && meta.etype.back() == '/')
+        meta.etype.pop_back();
+
+    // final part: e.g. "M0.mtx"
+    std::string fname = mtx_file.substr(mtx_file.find_last_of('/') + 1);
+    // remove ".mtx"
+    size_t dotPos = fname.find(".mtx");
+    if (dotPos != std::string::npos)
+        meta.AMatName = fname.substr(0, dotPos);
+    else
+        meta.AMatName = fname;
+
+    meta.nnz = 0;
+    return meta;
+}
+
+// -------------------------------------------------------------------
+// 3) readMTXdense
+// -------------------------------------------------------------------
+void readMTXdense(const std::string &mtx_file,
+                  std::vector<double> &A_data,
+                  size_t &m, size_t &k,
+                  FileMetadata &meta)
+{
+    std::ifstream infile(mtx_file);
+    if (!infile) {
+        std::cerr << "Error: cannot open " << mtx_file << "\n";
+        std::exit(1);
+    }
+
+    // skip comment lines (start with '%')
+    std::string line;
+    while (std::getline(infile, line)) {
+        if (!line.empty() && line[0] != '%') {
+            break;
+        }
+    }
+
+    // parse "m k nnz"
+    int mm, kk, nnz;
+    {
+        std::istringstream iss(line);
+        iss >> mm >> kk >> nnz; // typical .mtx line for dimension
+    }
+    m = static_cast<size_t>(mm);
+    k = static_cast<size_t>(kk);
+
+    meta.nnz       = nnz;
+    meta.m = m ;
+    meta.k = k;
+
+    // allocate dense array of size m*k, fill with 0
+    A_data.assign(m * k, 0.0);
+
+    // read the (row, col, val) lines
+    for (int i = 0; i < nnz; i++) {
+        int row, col;
+        double val;
+        infile >> row >> col >> val;
+        // matrix uses 1-based indexing => convert to 0-based
+        // store in column-major => A[col * m + row]
+        A_data[(col - 1) * m + (row - 1)] = val;
+    }
+    infile.close();
+}
+
+double efficiency(const FileMetadata &meta,
+                        size_t m, size_t k, size_t n,
+                        double avg_sec)
+{
+    double bw ; 
+
+         if (meta.device == "h100")    bw = 2e12;      // NVIDIA H100
+    else if (meta.device == "max1550") bw = 3.2768e12; // Intel MAX GPU
+    else  bw = 0.0; // 1 TB/s
+
+    // Print this 
+    std::cout << "Device: " << meta.device << ", BW: " << bw << " GB/s\n";
+
+    return 8 * n * (m + k) /bw/ avg_sec;
+}
+
+void writeOutputCSV(const FileMetadata &meta, size_t n, double avg, double eff)
+{
+std::string outFile = "results/benchmarks.csv";
+std::ofstream out(outFile, std::ios::app);
+if (!out) {
+std::cerr << "Error: cannot open " << outFile << "\n";
+return;
+}
+
+// Write header if empty
+if (out.tellp() == 0) {
+out << "device,backend,mmtype,order,etype,OpMat,m,k,n,nnz,wtime,efficiency\n";
+}
+
+// Now add a line
+out << meta.device << ","
+<< meta.backend << ","
+<< meta.mmtype << ","
+<< meta.order << ","
+<< meta.etype << ","
+<< meta.AMatName << ","
+<< meta.m << ","
+<< meta.k << ","
+<< n << ","
+<< meta.nnz << ","
+<< avg << ","
+<< eff << "\n";
+
+out.close();
+}
+
+// -------------------------------------------------------------------
+// 6) Write a dense matrix C to .mtx
+//    (This can help you manually verify correctness offline.)
+// -------------------------------------------------------------------
+void writeDenseMatrixToMTX(const std::string &outFile,
+                           const std::vector<double> &C,
+                           size_t m, size_t n)
+{
+    // For a fully dense m x n, the #nonzeros = m*n
+    std::ofstream ofs(outFile);
+    if (!ofs) {
+        std::cerr << "Error: cannot open " << outFile << " for writing.\n";
+        return;
+    }
+
+    long long nnz = (long long)m * (long long)n;
+
+    // Write the matrix market style header:  "m n nnz"
+    ofs << m << " " << n << " " << nnz << "\n";
+
+    // Now output each entry in row-major order:
+    // row col value   (1-based indexing)
+    for (size_t row = 0; row < m; row++) {
+        for (size_t col = 0; col < n; col++) {
+            double val = C[row * n + col];
+            ofs << (row + 1) << " " << (col + 1) << " " << val << "\n";
+        }
+    }
+    ofs.close();
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/base.h
+--------------------------------------------------------------------------------
+// Location: src/base.h
+
+#pragma once
+
+#include <string>
+#include <vector>
+#include <cstddef>  // for size_t
+
+// ----------------------------------------------------------
+// 1) Basic structs
+// ----------------------------------------------------------
+
+/// Metadata about the matrix file (order, etype, etc.).
+struct FileMetadata {
+    std::string device;   // e.g. "h100"
+    std::string backend;  // e.g. "direct"/"cuda"/"opencl"
+    std::string mmtype;   // "dense" / "sparse" / "bstream" / "bstream-msplit" / "cstream" / "cstream-ksplit"
+    std::string order;    // e.g. "3"
+    std::string etype;    // e.g. "hex"
+    std::string AMatName; // e.g. "M0"
+    int m   = 0;
+    int k   = 0;
+    int nnz = 0;          // #nonzeros (updated when reading .mtx)
+
+};
+
+/// Encapsulate command line arguments in a single struct.
+struct CmdLineArgs {
+    std::string device;   // e.g. "H100/A100/..."
+    std::string mmtype;   // e.g. "dense" / "sparse"
+    std::string matrixPath; // e.g. "operators/p3/hex/M0.mtx"
+    size_t n;             // columns of B (and C)
+    int niters;           // iteration count for timed loop
+};
+
+// ----------------------------------------------------------
+// 2) Command-line + file parsing
+// ----------------------------------------------------------
+
+/**
+ * \brief Parse the standard 5-argument command line:
+ *        <device> <mmtype> <matrix.mtx> <n> <niters>.
+ */
+CmdLineArgs parseCmdLineArgs(int argc, char* argv[]);
+
+/**
+ * \brief Parse the matrix file path (e.g., "operators/p3/hex/M0.mtx")
+ *        to fill FileMetadata (order, etype, AMatName).
+ */
+FileMetadata parseFilename(const std::string &mtx_file);
+
+// ----------------------------------------------------------
+// 3) Matrix reading
+// ----------------------------------------------------------
+
+/**
+ * \brief Read a .mtx file and store result into a dense array A_data.
+ *        The matrix is stored in column-major layout for use with cublasDgemm.
+ *        If the file is a sparse .mtx, this function still “densifies” it.
+ */
+void readMTXdense(const std::string &mtx_file,
+                  std::vector<double> &A_data,
+                  size_t &m, size_t &k,
+                  FileMetadata &meta);
+
+double efficiency(const FileMetadata &meta,
+                        size_t m, size_t k, size_t n,
+                        double avg_sec);
+
+/**
+ * \brief Append a line to results/benchmarks.csv with device, mmtype, dims, etc.
+ */
+void writeOutputCSV(const FileMetadata &meta, size_t n, double avg, double eff);
+
+// ----------------------------------------------------------
+// 5) Write a dense matrix C to a .mtx file for debugging
+// ----------------------------------------------------------
+/**
+ * \brief Write the dense matrix C (m x n) to disk in .mtx (COO) format.
+ *        This is purely for offline inspection.
+ */
+void writeDenseMatrixToMTX(const std::string &outFile,
+                           const std::vector<double> &C,
+                           size_t m, size_t n);
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/cuda/base.cpp
+--------------------------------------------------------------------------------
+// Location: src/cuda/base.cpp
+
+#include "src/cuda/base.h"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <iostream>
+#include <cmath>    // for std::abs
+
+
+void cudaAllocDouble(double** dPtr, size_t n)
+{
+    cudaMalloc(dPtr, n * sizeof(double));
+}
+
+void cudaCopyToDevice(double* dPtr,
+                      const std::vector<double>& hData,
+                      size_t n)
+{
+    cudaMemcpy(dPtr, hData.data(),
+               n * sizeof(double),
+               cudaMemcpyHostToDevice);
+}
+
+void cudaCopyToHost(std::vector<double>& hData,
+                    const double* dPtr,
+                    size_t n)
+{
+    cudaMemcpy(hData.data(),
+               dPtr,
+               n * sizeof(double),
+               cudaMemcpyDeviceToHost);
+}
+
+void cudaFreeDouble(double* dPtr)
+{
+    if (dPtr) {
+        cudaFree(dPtr);
+    }
+}
+
+
+bool checkCublasGemmCorrectness(cublasHandle_t handle,
+    size_t m, size_t n, size_t k,
+    const double* dA,
+    const double* dB,
+    const double* dC,
+    double alpha,
+    double beta,
+    double tol)
+{
+// 1) Allocate dR
+size_t lenC = m * n;
+double* dR = nullptr;
+cudaAllocDouble(&dR, lenC);
+
+// 2) Zero-initialize dR (or the existing contents) before calling gemm
+cudaMemset(dR, 0, lenC*sizeof(double));
+
+// 3) Do cublas gemm: R = alpha*A*B + beta*R
+cublasStatus_t stat = cublasDgemm(handle,
+          CUBLAS_OP_N, CUBLAS_OP_N,
+          (int)m, (int)n, (int)k,
+          &alpha,
+          dA, (int)m,
+          dB, (int)k,
+          &beta,
+          dR, (int)m);
+if (stat != CUBLAS_STATUS_SUCCESS) {
+std::cerr << "checkCublasGemmCorrectness: cublasDgemm failed with code "
+<< stat << std::endl;
+cudaFreeDouble(dR);
+return false;
+}
+cudaDeviceSynchronize();
+
+// 4) Copy both dC and dR back to host
+std::vector<double> C_host(lenC), R_host(lenC);
+cudaCopyToHost(C_host, dC, lenC);
+cudaCopyToHost(R_host, dR, lenC);
+
+// 5) Compare
+bool match = true;
+for (size_t i = 0; i < lenC; i++) {
+double diff = std::abs(R_host[i] - C_host[i]);
+if (diff > tol) {
+match = false;
+break;
+}
+}
+
+// 6) If mismatch, print the first 10 elements
+if (!match) {
+std::cerr << "[checkCublasGemmCorrectness] Mismatch found!\n";
+std::cerr << "First 10 elements from test (C) vs. reference (R):\n";
+for (size_t i = 0; i < 10 && i < lenC; i++) {
+double diff = std::abs(R_host[i] - C_host[i]);
+std::cerr << "  idx " << i
+<< ": C=" << C_host[i]
+<< ", R=" << R_host[i]
+<< ", diff=" << diff << "\n";
+}
+}
+
+// 7) Free dR
+cudaFreeDouble(dR);
+
+return match;
+}________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/cuda/base.h
+--------------------------------------------------------------------------------
+// src/cuda/base.h
+
+#pragma once
+
+#include <vector>
+#include <cstddef>
+#include <cublas_v2.h>
+
+/**
+ * Allocate device memory for a double array of length n.
+ */
+void cudaAllocDouble(double** dPtr, size_t n);
+
+/**
+ * Copy from host (std::vector<double>) to device array.
+ */
+void cudaCopyToDevice(double* dPtr, const std::vector<double>& hData, size_t n);
+
+/**
+ * Copy from device array to host (std::vector<double>).
+ */
+void cudaCopyToHost(std::vector<double>& hData, const double* dPtr, size_t n);
+
+/**
+ * Free a device double* pointer if non-null.
+ */
+void cudaFreeDouble(double* dPtr);
+
+/**
+ * \brief Perform a host-side correctness check on dC vs. a reference multiply in dR.
+ *        That is, we do: R = alpha*A*B + beta*R (with cublas) on a temporary device array dR,
+ *        then copy both dC and dR to host, compare them elementwise.
+ *
+ * \param handle  (in)   A valid cublas handle
+ * \param m       (in)   #rows in A (and C)
+ * \param n       (in)   #cols in B (and C)
+ * \param k       (in)   #cols in A, #rows in B
+ * \param dA      (in)   Device pointer to A (m*k)
+ * \param dB      (in)   Device pointer to B (k*n)
+ * \param dC      (in)   Device pointer to the "test" C  (m*n)
+ * \param alpha   (in)   Alpha scalar for cublasDgemm
+ * \param beta    (in)   Beta scalar for cublasDgemm
+ * \param tol     (in)   Allowed numerical tolerance
+ *
+ * \return True if all elements match within tol, else false.
+ *         If false, also prints the first few elements/differences.
+ */
+bool checkCublasGemmCorrectness(cublasHandle_t handle,
+                                size_t m, size_t n, size_t k,
+                                const double* dA,
+                                const double* dB,
+                                const double* dC,
+                                double alpha,
+                                double beta,
+                                double tol = 1e-6);
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/cuda/dense.cpp
+--------------------------------------------------------------------------------
+// Location: src/cuda/dense.cpp
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+#include "src/base.h"         // parseCmdLineArgs, readMTXdense, etc.
+#include "src/cuda/base.h"    // cudaAllocDouble, cudaCopyToHost, etc.
+
+using namespace std;
+using namespace std::chrono;
+
+int main(int argc, char* argv[])
+{
+    CmdLineArgs args = parseCmdLineArgs(argc, argv);
+    FileMetadata meta = parseFilename(args.matrixPath);
+    meta.mmtype = args.mmtype;
+    meta.backend = "direct";
+    meta.device = args.device;
+
+    // 3. Read A
+    vector<double> A_data; size_t m, k; readMTXdense(args.matrixPath, A_data, m, k, meta);
+
+    // 4. Prepare B, C on host
+    //    B is k x n, all ones
+    //    C is m x n, all zeros
+    vector<double> B_data(k * args.n, 1.0);
+    vector<double> C_data(m * args.n, 0.0);
+    
+    // 5. Allocate device memory
+    double *dA=nullptr, *dB=nullptr, *dC=nullptr;
+    
+    cudaAllocDouble(&dA, A_data.size());
+    cudaAllocDouble(&dB, B_data.size());
+    cudaAllocDouble(&dC, C_data.size());
+    
+    // 6. Copy host -> device
+    cudaCopyToDevice(dA, A_data, A_data.size());
+    cudaCopyToDevice(dB, B_data, B_data.size());
+    cudaCopyToDevice(dC, C_data, C_data.size());
+
+    // 7. Create cuBLAS handle
+    cublasHandle_t handle;
+    cublasCreate(&handle);
+    
+    double alpha = 1.0, beta = 0.0;
+    
+    // 8. Warm-up
+    cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, (int)m, (int)args.n, (int)k,
+                &alpha, dA, (int)m, dB, (int)k, &beta, dC, (int)m);
+        cudaDeviceSynchronize();
+        
+    // 8. Check correctness: compare dC vs. reference (computed internally)
+    bool ok = checkCublasGemmCorrectness(handle, m, args.n, k, dA, dB, dC, alpha, beta, 1e-6);
+    if (!ok) { cerr << "[Warm-Up] Results do not match reference.\n"; return 1; }
+
+    // 9. Timed loop
+    auto start = high_resolution_clock::now();
+    for(int i = 0; i < args.niters; i++)
+    {
+        cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, (int)m, (int)args.n, (int)k, 
+                    &alpha, dA, (int)m, dB, (int)k, &beta, dC, (int)m);
+    }                
+    cudaDeviceSynchronize();
+    auto end = high_resolution_clock::now();
+    double avg = duration<double>(end - start).count() / args.niters;
+    writeOutputCSV(meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+
+    // Cleanup
+    cublasDestroy(handle);
+    cudaFreeDouble(dA);
+    cudaFreeDouble(dB);
+    cudaFreeDouble(dC);
+
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/cuda/kernel_launch.cpp
+--------------------------------------------------------------------------------
+// Location: src/cuda/kernel_launch.cpp
+
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+
+#include "src/base.h"         // parseCmdLineArgs, readMTXdense, etc.
+#include "src/cuda/base.h"    // cudaAllocDouble, cudaCopyToDevice, cudaCopyToHost, etc.
+
+using namespace std;
+using namespace std::chrono;
+
+// The GiMMiK kernel is declared as an extern symbol so the linker knows about it.
+// The actual definition is in, e.g., "kernels/gimmik/cuda/p3/hex/M0.cpp"
+extern __global__ void gimmik_mm(int n,
+                                 const double* __restrict__ b, int ldb,
+                                 double* __restrict__ c, int ldc);
+
+/**
+ * \brief Parse the kernel path, e.g. "kernels/gimmik/cuda/p3/hex/M0.cpp"
+ *        to build a matching .mtx path "operators/p3/hex/M0.mtx".
+ *        Similar to parseFilename, but we parse from kernel path.
+ *
+ * \param kernelPath (in) path to the GiMMiK kernel .cpp file
+ * \param meta       (out) partially filled FileMetadata (order, etype, AMatName, mmtype)
+ * \return           the derived .mtx path, e.g. "operators/p3/hex/M0.mtx"
+ */
+std::string kernelToMtxPath(const std::string &kernelPath, FileMetadata &meta)
+{
+    // Example: kernelPath = "kernels/gimmik/cuda/p3/hex/M0_bstream.cpp"
+    // 1) Find "kernels/gimmik/p"
+    size_t pos = kernelPath.find("kernels/gimmik/p");
+    if (pos == std::string::npos) {
+        // Fallback if not found
+        return "";
+    }
+    // Advance past "kernels/gimmik/"
+    pos += std::string("kernels/gimmik/").size();
+
+    // Next char => polynomial order, e.g. "3"
+    // So "p3" => we skip 'p'
+    pos++; // skip 'p'
+    meta.order = kernelPath.substr(pos, 1);
+
+    // Next slash => e.g. "...p3/hex..."
+    size_t slashPos = kernelPath.find('/', pos);
+    // Extract up to 3 letters for etype, e.g. "hex"
+    meta.etype = kernelPath.substr(slashPos + 1, 3);
+
+    // Final filename => e.g. "M0_bstream.cpp"
+    std::string fname = kernelPath.substr(kernelPath.find_last_of('/') + 1);
+    // Remove ".cpp"
+    size_t dotPos = fname.rfind(".cpp");
+    std::string baseName = (dotPos != std::string::npos)
+                           ? fname.substr(0, dotPos)
+                           : fname;
+
+    // There will always be three words separated by underscore
+    // e.g. "M0_cuda_bstream-ksplit" => AMatName="M0", backend="cuda", mmtype="bstream-ksplit"
+    // THIS IS ALWAYS THE TEMPLATE.
+    meta.AMatName = baseName.substr(0, baseName.find('_'));
+    meta.backend = baseName.substr(baseName.find('_') + 1, baseName.rfind('_') - baseName.find('_') - 1);
+    meta.mmtype = baseName.substr(baseName.rfind('_') + 1);
+
+    // Prefix meta.mmtype with gimmik_
+    meta.mmtype = "gimmik_" + meta.mmtype;
+
+    
+
+    // meta.mmtype   = baseName.substr(underscorePos + 1);
+
+
+    // Build .mtx path => e.g. "operators/p3/hex/M0.mtx"
+    //     where meta.order = "3", meta.etype = "hex", meta.AMatName = "M0"
+    std::string mtxPath = "operators/p" + meta.order + "/" + meta.etype
+                          + "/" + meta.AMatName + ".mtx";
+    return mtxPath;
+}
+
+
+int main(int argc, char* argv[])
+{
+    // -------------------------------------------------------------------------
+    // 1. Parse command line
+    //    Usage: <device> <kernelPath> <n> <niters>
+    // -------------------------------------------------------------------------
+    if (argc < 5) {
+        cerr << "Usage: " << argv[0]
+             << " <device> <kernelPath> <n> <niters>\n";
+        return 1;
+    }
+
+    // We'll manually create a CmdLineArgs struct just for consistency
+    CmdLineArgs args;
+    args.device     = argv[1];           // e.g. "H100"
+    std::string kernelPath = argv[2];    // e.g. "kernels/gimmik/cuda/p3/hex/M0.cpp"
+    args.n          = static_cast<size_t>(atoi(argv[3]));  // number of columns in B
+    args.niters     = atoi(argv[4]);     // iteration count
+
+    // -------------------------------------------------------------------------
+    // 2. From the kernelPath, build the .mtx path => parse metadata
+    // -------------------------------------------------------------------------
+    FileMetadata meta;
+    std::string mtxPath = kernelToMtxPath(kernelPath, meta);
+
+    meta.device = args.device;
+
+    // If mtxPath empty, warn and exit
+    if (mtxPath.empty()) {
+        cerr << "Error: unable to derive .mtx from kernel path: " << kernelPath << "\n";
+        return 1;
+    }
+
+    // Read the matrix from .mtx => we only need (m, k) for sizing B, C
+    // This function stores the matrix in col-major (m x k) in A_data
+    vector<double> A_data;
+    size_t m, k;
+    readMTXdense(mtxPath, A_data, m, k, meta);
+
+    // -------------------------------------------------------------------------
+    // 3. Prepare B, C on host
+    //    B => (k x n) all ones
+    //    C => (m x n) all zeros
+    // -------------------------------------------------------------------------
+    vector<double> B_host(k * args.n, 1.0);
+    vector<double> C_host(m * args.n, 0.0);
+
+    // -------------------------------------------------------------------------
+    // 4. Allocate device memory for B, C, copy data
+    // -------------------------------------------------------------------------
+    double *dB = nullptr, *dC = nullptr;
+    cudaAllocDouble(&dB, B_host.size());
+    cudaAllocDouble(&dC, C_host.size());
+
+    cudaCopyToDevice(dB, B_host, B_host.size());
+    cudaCopyToDevice(dC, C_host, C_host.size());
+
+    // Note: The GiMMiK kernel presumably has matrix A baked in,
+    //       so we do not need a device copy of A for the kernel itself.
+    //       We only use A_data if we want to verify correctness with cuBLAS.
+
+    // -------------------------------------------------------------------------
+    // 5. Create block/grid dimensions and do a warm-up kernel launch
+    // -------------------------------------------------------------------------
+    int blockSize = 128;  // could also use 256
+    int gridSize  = (static_cast<int>(args.n) + blockSize - 1) / blockSize;
+
+    // We pass n as the leading dimension in a row-major interpretation:
+    //   B has shape (k x n), but the kernel expects B as [row i, col j].
+    //   We effectively treat B row-major => ldb = n. Same for C => ldc = n.
+    int ldb = static_cast<int>(args.n);
+    int ldc = static_cast<int>(args.n);
+
+    gimmik_mm<<<gridSize, blockSize>>>(static_cast<int>(args.n), dB, ldb, dC, ldc);
+    cudaDeviceSynchronize();
+
+    // -------------------------------------------------------------------------
+    // 6. Correctness check vs. cuBLAS (similar to dense/sparse)
+    // -------------------------------------------------------------------------
+    {
+        // Create a cuBLAS handle
+        cublasHandle_t blasHandle;
+        cublasCreate(&blasHandle);
+
+        // a) Allocate dA for the reference multiply
+        double *dA = nullptr;
+        cudaAllocDouble(&dA, A_data.size());
+        cudaCopyToDevice(dA, A_data, A_data.size());
+
+        // b) Allocate dR for the reference result => size (m x n)
+        double *dR = nullptr;
+        cudaAllocDouble(&dR, C_host.size());
+        cudaMemset(dR, 0, C_host.size() * sizeof(double));
+
+        // c) dR = A * B (col-major gemm)
+        double alpha = 1.0, beta = 0.0;
+        cublasDgemm(blasHandle,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    static_cast<int>(m),
+                    static_cast<int>(args.n),
+                    static_cast<int>(k),
+                    &alpha,
+                    dA, static_cast<int>(m),
+                    dB, static_cast<int>(k),
+                    &beta,
+                    dR, static_cast<int>(m));
+        cudaDeviceSynchronize();
+
+        // d) Compare dC vs. dR using our helper
+        bool ok = checkCublasGemmCorrectness(blasHandle,
+                                             m, args.n, k,
+                                             dA, dB, dC,
+                                             alpha, beta,
+                                             1e-6);
+        if (!ok) {
+            cerr << "[Warm-up] GiMMiK kernel results do not match reference.\n";
+            // Clean up before returning
+            cublasDestroy(blasHandle);
+            cudaFreeDouble(dA);
+            cudaFreeDouble(dR);
+            return 1;
+        }
+
+        // e) Cleanup reference resources
+        cublasDestroy(blasHandle);
+        cudaFreeDouble(dA);
+        cudaFreeDouble(dR);
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Timed loop of the kernel launch
+    // -------------------------------------------------------------------------
+    auto start = high_resolution_clock::now();
+    for (int i = 0; i < args.niters; i++) {
+        gimmik_mm<<<gridSize, blockSize>>>(static_cast<int>(args.n), dB, ldb, dC, ldc);
+    }
+    cudaDeviceSynchronize();
+    auto end = high_resolution_clock::now();
+
+    // Check for any launch errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        cerr << "Kernel launch failed: " << cudaGetErrorString(err) << "\n";
+        // Still proceed to measure time, but it's indicative of an error.
+    }
+
+    double avg = duration<double>(end - start).count() / args.niters;
+
+    // -------------------------------------------------------------------------
+    // 8. Print CSV output (similar to dense/sparse)
+    // -------------------------------------------------------------------------
+    // We'll reuse the same "direct" backend label for consistent logging
+
+    // Name this kernel launch as "gimmik_"+ name of the kernel.
+    // For example, in kernels/gimmik/p3/hex/M0_cuda_bstream.cpp the name is bstream, which is the last part after underscore
+    // We use the last part of the kernel path as the backend name.
+    // e.g. "bstream"
+
+    
+    
+    writeOutputCSV(meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+
+    // -------------------------------------------------------------------------
+    // 9. Cleanup
+    // -------------------------------------------------------------------------
+    cudaFreeDouble(dB);
+    cudaFreeDouble(dC);
+
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/cuda/sparse.cpp
+--------------------------------------------------------------------------------
+// Location: "src/cuda/sparse.cpp"
+// nvcc -O3 
+//      -Wno-deprecated-declarations src/cuda/sparse.cpp src/base.cpp src/cuda/base.cpp 
+//      -x cu 
+//      -o src/cuda/sparse.exe -lcusparse -lcublas
+// ./src/cuda/sparse.exe h100 sparse operators/p3/hex/M0.mtx 1000000 5
+
+#include <cuda_runtime.h>
+#include <cusparse.h>
+#include <cublas_v2.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cmath>
+
+#include "src/base.h"       // parseCmdLineArgs, readMTXdense, parseFilename, etc.
+#include "src/cuda/base.h"  // cudaAllocDouble, cudaCopyToDevice, cudaCopyToHost, etc.
+
+using namespace std;
+using namespace std::chrono;
+
+int main(int argc, char* argv[])
+{
+    // 1. Parse command-line (similar to dense)
+    CmdLineArgs args = parseCmdLineArgs(argc, argv);
+
+    // 2. Parse metadata from path
+    FileMetadata meta = parseFilename(args.matrixPath);
+    meta.mmtype = args.mmtype; // e.g. "sparse"
+    meta.backend = "direct";
+
+    // 3. Read matrix A in dense form first (so we can do a reference check)
+    vector<double> A_data;
+    size_t m, k;
+    readMTXdense(args.matrixPath, A_data, m, k, meta); // dense, col-major
+    int nnz = meta.nnz;  // number of nonzeros from the .mtx
+
+    // ---- Convert dense => CSR ----
+    //    We'll do a 2-pass approach to fill rowPtr, colInd, vals
+    vector<int> hRowPtr(m+1, 0);
+    vector<int> hColInd(nnz);
+    vector<double> hVals(nnz);
+
+    // pass 1: count per row
+    for (size_t col = 0; col < k; col++) {
+        for (size_t row = 0; row < m; row++) {
+            double val = A_data[col*m + row];
+            if (val != 0.0) {
+                hRowPtr[row+1]++;
+            }
+        }
+    }
+    for (size_t r = 0; r < m; r++) {
+        hRowPtr[r+1] += hRowPtr[r];
+    }
+
+    // pass 2: fill colInd, vals
+    vector<int> rowStart = hRowPtr;
+    for (size_t col = 0; col < k; col++) {
+        for (size_t row = 0; row < m; row++) {
+            double val = A_data[col*m + row];
+            if (val != 0.0) {
+                int dest = rowStart[row]++;
+                hColInd[dest] = (int)col;
+                hVals[dest]   = val;
+            }
+        }
+    }
+
+    // 4. Prepare B, C on host (like in dense.cpp)
+    //    B is k x n (all ones), C is m x n (zeros)
+    vector<double> B_host(k * args.n, 1.0);
+    vector<double> C_host(m * args.n, 0.0);
+
+    // 5. Allocate device memory for the CSR, B, C
+    int *dRowPtr = nullptr, *dColInd = nullptr;
+    double *dVals = nullptr, *dB = nullptr, *dC = nullptr;
+
+    cudaMalloc(&dRowPtr, (m+1)*sizeof(int));
+    cudaMalloc(&dColInd, nnz*sizeof(int));
+    cudaMalloc(&dVals,   nnz*sizeof(double));
+
+    cudaAllocDouble(&dB, B_host.size()); // actually (k*n)
+    cudaAllocDouble(&dC, C_host.size()); // (m*n)
+
+    // 6. Copy host->device
+    cudaMemcpy(dRowPtr,  hRowPtr.data(),  (m+1)*sizeof(int),    cudaMemcpyHostToDevice);
+    cudaMemcpy(dColInd,  hColInd.data(),  nnz*sizeof(int),      cudaMemcpyHostToDevice);
+    cudaMemcpy(dVals,    hVals.data(),    nnz*sizeof(double),   cudaMemcpyHostToDevice);
+
+    cudaCopyToDevice(dB, B_host, B_host.size());
+    cudaCopyToDevice(dC, C_host, C_host.size());
+
+    // 7. Create cuSPARSE handle
+    cusparseHandle_t spHandle;
+    cusparseCreate(&spHandle);
+
+    // 8. Create the SpMat and DnMat descriptors
+    cusparseSpMatDescr_t matA;
+    cusparseCreateCsr(&matA,
+        (int)m, (int)k, nnz,
+        dRowPtr, dColInd, dVals,
+        CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+        CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+
+    cusparseDnMatDescr_t matB, matC;
+    // B is k x n, col-major
+    cusparseCreateDnMat(&matB, (int)k, (int)args.n, (int)k,
+                        dB, CUDA_R_64F, CUSPARSE_ORDER_COL);
+    // C is m x n, col-major
+    cusparseCreateDnMat(&matC, (int)m, (int)args.n, (int)m,
+                        dC, CUDA_R_64F, CUSPARSE_ORDER_COL);
+
+    double alpha = 1.0, beta = 0.0;
+
+    // 9. Setup SpMM buffer
+    cusparseSpMMAlg_t alg = CUSPARSE_SPMM_ALG_DEFAULT;
+    size_t bufferSize = 0;
+    void* dBuffer = nullptr;
+    cusparseSpMM_bufferSize(spHandle,
+        CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matA, matB, &beta, matC,
+        CUDA_R_64F, alg, &bufferSize);
+    cudaMalloc(&dBuffer, bufferSize);
+
+    // -------- Warm-up: spMM => dC --------
+    cusparseSpMM(spHandle,
+        CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+        &alpha, matA, matB, &beta, matC,
+        CUDA_R_64F, alg, dBuffer);
+    cudaDeviceSynchronize();
+
+    // -------- Correctness check vs. dense reference --------
+    // We'll reuse the dense array A_data on the device. We need a separate device pointer dA_dense:
+    double *dA_dense = nullptr;
+    cudaAllocDouble(&dA_dense, A_data.size());
+    cudaCopyToDevice(dA_dense, A_data, A_data.size());
+
+    // We'll also allocate a reference pointer dR. We'll do cublasDgemm => dR, then compare to dC.
+    double *dR = nullptr;
+    cudaAllocDouble(&dR, C_host.size());  // m*n
+    cudaMemset(dR, 0, C_host.size()*sizeof(double));
+
+    // Create a cuBLAS handle for reference multiply
+    cublasHandle_t blasHandle;
+    cublasCreate(&blasHandle);
+
+    // dR = A * B  (dense) => reference
+    // A is (m x k), B is (k x n), col-major
+    // => cublasDgemm uses leading dims: A => m, B => k, C => m
+    cublasDgemm(blasHandle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)m, (int)args.n, (int)k,
+                &alpha,
+                dA_dense, (int)m,
+                dB,       (int)k,
+                &beta,
+                dR,       (int)m);
+    cudaDeviceSynchronize();
+
+    // Now copy dC and dR back to host to compare
+    vector<double> sparseC(m*args.n), refC(m*args.n);
+    cudaCopyToHost(sparseC, dC, sparseC.size());
+    cudaCopyToHost(refC,    dR, refC.size());
+
+    bool match = true;
+    for (size_t i = 0; i < sparseC.size(); i++) { 
+        double diff = fabs(sparseC[i] - refC[i]);
+        if (diff > 1e-6) {
+            match = false;
+            break;
+        }
+    }
+    if (!match) { cerr << "MISMATCH !!! cuSPARSE result ≠ cuBLAS reference.\n"; return 1; }
+
+    // ------ Timed loop for SpMM ------
+    auto start = high_resolution_clock::now();
+    for(int i = 0; i < args.niters; i++){
+        cusparseSpMM(spHandle,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &alpha, matA, matB, &beta, matC,
+            CUDA_R_64F, alg, dBuffer);
+    }
+    cudaDeviceSynchronize();
+    auto end = high_resolution_clock::now();
+    double avg = duration<double>(end - start).count() / args.niters;
+    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+
+    // ------ Cleanup ------
+    cudaFree(dBuffer);
+    cusparseDestroySpMat(matA);
+    cusparseDestroyDnMat(matB);
+    cusparseDestroyDnMat(matC);
+    cusparseDestroy(spHandle);
+
+    cublasDestroy(blasHandle);
+
+    cudaFree(dRowPtr);
+    cudaFree(dColInd);
+    cudaFree(dVals);
+    cudaFree(dB);
+    cudaFree(dC);
+
+    cudaFreeDouble(dA_dense);
+    cudaFreeDouble(dR);
+
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/hip/base.cpp
+--------------------------------------------------------------------------------
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/hip/base.h
+--------------------------------------------------------------------------------
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/00_basic.cpp
+--------------------------------------------------------------------------------
+// src/opencl/dense.cpp
+
+#define CL_TARGET_OPENCL_VERSION 300
+
+#include <CL/cl.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+// Include tinytc’s C API header (make sure this is the correct one for your version)
+#include "/home/sambit.mishra/.local/install/include/tinytc/tinytc_cl.h"  // or <tinytc.h> depending on your install
+
+using namespace std;
+using namespace std::chrono;
+
+int main(int argc, char* argv[])
+{
+    inline auto tinytc::get_support_level(cl_device_id device)
+    
+
+
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/base.cpp
+--------------------------------------------------------------------------------
+
+#define CL_HPP_TARGET_OPENCL_VERSION 300
+
+#include "src/opencl/base.h"
+#include <iostream>
+
+// This matches the logic you used in the CUDA code but is now placed in OpenCL base.
+std::string kernelToMtxPath(const std::string &kernelPath, FileMetadata &meta)
+{
+    // Example: kernelPath = "kernels/gimmik/p3/hex/M0_opencl_bstream.cpp"
+    // 1) Find "kernels/gimmik/p"
+    size_t pos = kernelPath.find("kernels/gimmik/p");
+    if (pos == std::string::npos) {
+        // Fallback if not found
+        return "";
+    }
+    // Advance past "kernels/gimmik/"
+    pos += std::string("kernels/gimmik/").size();
+
+    // Next char => polynomial order, e.g. "3"
+    // So "p3" => we skip 'p'
+    pos++; // skip 'p'
+    meta.order = kernelPath.substr(pos, 1);
+
+    // Next slash => e.g. "...p3/hex..."
+    size_t slashPos = kernelPath.find('/', pos);
+    // Extract up to 3 letters for etype, e.g. "hex"
+    meta.etype = kernelPath.substr(slashPos + 1, 3);
+
+    // Final filename => e.g. "M0_opencl_bstream.cpp"
+    std::string fname = kernelPath.substr(kernelPath.find_last_of('/') + 1);
+    // Remove ".cpp"
+    size_t dotPos = fname.rfind(".cpp");
+    std::string baseName = (dotPos != std::string::npos)
+                           ? fname.substr(0, dotPos)
+                           : fname;
+
+    // The filename portion presumably has the pattern "M0_opencl_bstream",
+    // so we do the same logic as in the CUDA version:
+    meta.AMatName = baseName.substr(0, baseName.find('_'));
+    meta.backend  = baseName.substr(baseName.find('_') + 1,
+                                    baseName.rfind('_') - baseName.find('_') - 1);
+    meta.mmtype   = baseName.substr(baseName.rfind('_') + 1);
+
+    // Prefix mmtype with "gimmik_"
+    meta.mmtype = "gimmik_" + meta.mmtype;
+
+    // Build .mtx path => e.g. "operators/p3/hex/M0.mtx"
+    std::string mtxPath = "operators/p" + meta.order + "/" + meta.etype
+                          + "/" + meta.AMatName + ".mtx";
+    return mtxPath;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/base.h
+--------------------------------------------------------------------------------
+#pragma once
+
+#include <string>
+#include "src/base.h"  // For FileMetadata, etc.
+
+/**
+ * \brief Parse the kernel path, e.g. "kernels/gimmik/p3/hex/M0_opencl_bstream.cpp"
+ *        to build a matching .mtx path "operators/p3/hex/M0.mtx".
+ *        Similar logic to the CUDA version.
+ */
+std::string kernelToMtxPath(const std::string &kernelPath, FileMetadata &meta);
+
+/**
+ * Optionally, you could put more OpenCL utility prototypes here,
+ * e.g. a checkOpenCLError(...) function, or device-querying functions, etc.
+ */
+
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/dense.cpp
+--------------------------------------------------------------------------------
+// src/opencl/dense.cpp
+
+#define CL_TARGET_OPENCL_VERSION 300
+
+#include <CL/cl.h>
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+// Include tinytc’s C API header (make sure this is the correct one for your version)
+#include "/home/sambit.mishra/.local/install/include/tinytc/tinytc_cl.h"  // or <tinytc.h> depending on your install
+
+#include "src/base.h"       // For parseCmdLineArgs, readMTXdense, etc.
+#include "src/opencl/base.h"  // For setupOpenCL(), teardownOpenCL(), checkTinyTCGemmCorrectness()
+
+using namespace std;
+using namespace std::chrono;
+
+int main(int argc, char* argv[])
+{
+    // 1. Parse command-line and read matrix
+    CmdLineArgs args = parseCmdLineArgs(argc, argv);
+    FileMetadata meta = parseFilename(args.matrixPath);
+    meta.mmtype = args.mmtype;
+
+    vector<double> A_data;
+    size_t m, k;
+    readMTXdense(args.matrixPath, A_data, m, k, meta);
+
+    // Prepare B (k x n, ones) and C (m x n, zeros)
+    vector<double> B_data(k * args.n, 1.0);
+    vector<double> C_data(m * args.n, 0.0);
+
+    // 2. Setup OpenCL context, device, and queue
+    cl_context context = nullptr;
+    cl_device_id device = nullptr;
+    cl_command_queue queue = nullptr;
+    if (!setupOpenCL(context, device, queue)) {
+        cerr << "Error: setupOpenCL() failed." << endl;
+        return 1;
+    }
+
+    // 3. Create tinytc core info and source context
+    tinytc_core_info_t info = nullptr;
+    tinytc_status_t st = tinytc_cl_core_info_create(&info, device);
+    if (st != 0 /*or your success code, e.g. TINYTc_SUCCESS*/) {
+        cerr << "Error: tinytc_cl_core_info_create failed, st=" << (int)st << endl;
+        return 1;
+    }
+
+    tinytc_source_context_t source_ctx = nullptr;
+    st = tinytc_source_context(&source_ctx, NULL, 0);  // renamed function
+    if (st != 0) {
+        cerr << "Error: tinytc_create_source_context failed, st=" << (int)st << endl;
+        return 1;
+    }
+
+    // 4. Allocate OpenCL buffers and copy A, B, C to device
+    cl_int err = CL_SUCCESS;
+    cl_mem dA = clCreateBuffer(context, CL_MEM_READ_WRITE, A_data.size() * sizeof(double), nullptr, &err);
+    cl_mem dB = clCreateBuffer(context, CL_MEM_READ_WRITE, B_data.size() * sizeof(double), nullptr, &err);
+    cl_mem dC = clCreateBuffer(context, CL_MEM_READ_WRITE, C_data.size() * sizeof(double), nullptr, &err);
+    
+    clEnqueueWriteBuffer(queue, dA, CL_TRUE, 0, A_data.size() * sizeof(double), A_data.data(), 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(queue, dB, CL_TRUE, 0, B_data.size() * sizeof(double), B_data.data(), 0, nullptr, nullptr);
+    clEnqueueWriteBuffer(queue, dC, CL_TRUE, 0, C_data.size() * sizeof(double), C_data.data(), 0, nullptr, nullptr);
+
+    // 5. Create the tall-and-skinny GEMM recipe (using the tinytc C API)
+    double alpha = 1.0, beta = 0.0;
+    int M = static_cast<int>(m), N = static_cast<int>(args.n), K = static_cast<int>(k);
+    int ldA = M, ldB = K, ldC = M;
+    
+    tinytc_recipe_t recipe = nullptr;
+    st = tinytc_create_recipe_ts_gemm(&recipe, info,
+                                      M, N, K,
+                                      ldA, ldB, ldC,
+                                      alpha, beta,
+                                      0, 0, 0,
+                                      source_ctx);
+    if (st != 0) {
+        cerr << "Error: tinytc_create_recipe_ts_gemm failed, st=" << (int)st << endl;
+        return 1;
+    }
+
+    // 6. Create a recipe handler
+    tinytc_recipe_handler_t handler = nullptr;
+    st = tinytc_recipe_handler(&handler, context, device, recipe, source_ctx);
+    if (st != 0) {
+        cerr << "Error: tinytc_create_recipe_handler failed, st=" << (int)st << endl;
+        return 1;
+    }
+
+    // 7. Bind the device buffers to the recipe
+    st = tinytc_set_recipe_ts_gemm_args(handler,
+                                        (void*)dA, tinytc_mem_type_buffer,
+                                        (void*)dB, tinytc_mem_type_buffer,
+                                        (void*)dC, tinytc_mem_type_buffer);
+    if (st != 0) {
+        cerr << "Error: tinytc_set_recipe_ts_gemm_args failed, st=" << (int)st << endl;
+        return 1;
+    }
+
+    // 8. Warm-up and correctness check
+    st = tinytc_cl_recipe_handler_submit(handler, queue, 0, nullptr, nullptr);
+    clFinish(queue);
+    
+    bool ok = checkTinyTCGemmCorrectness(context, queue, info, source_ctx, m, N, k,
+                                         dA, dB, dC, alpha, beta, 1e-6);
+    if (!ok) {
+        cerr << "[Warm-Up] GEMM result mismatch." << endl;
+        return 1;
+    }
+
+    // 9. Timed loop
+    auto start_time = high_resolution_clock::now();
+    for (int i = 0; i < args.niters; i++) {
+        st = tinytc_cl_recipe_handler_submit(handler, queue, 0, nullptr, nullptr);
+    }
+    clFinish(queue);
+    auto end_time = high_resolution_clock::now();
+    double avg = duration<double>(end_time - start_time).count() / args.niters;
+
+    writeOutputCSV(args.device, meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
+
+    // 10. Cleanup tinytc and OpenCL objects
+    tinytc_recipe_handler(handler);
+    tinytc_recipe(recipe);
+    tinytc_core_info(info);
+    tinytc_source_context(source_ctx);
+
+    if(dA) clReleaseMemObject(dA);
+    if(dB) clReleaseMemObject(dB);
+    if(dC) clReleaseMemObject(dC);
+
+    teardownOpenCL(context, queue);
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/kernel_launch.cpp
+--------------------------------------------------------------------------------
+// Location: src/opencl/kernel_launch.cpp
+
+// Define OpenCL 300
+#define CL_HPP_TARGET_OPENCL_VERSION 300
+
+#include "src/opencl/base.h"   // kernelToMtxPath, etc.
+#include "src/base.h"          // readMTXdense, FileMetadata, etc.
+#include <CL/opencl.hpp>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+
+using namespace std;
+using namespace std::chrono;
+
+/**
+ * \brief Read an OpenCL kernel source file and return its contents as a string.
+ */
+static std::string readKernelSource(const std::string &kernelPath)
+{
+    std::ifstream ifs(kernelPath);
+    if (!ifs.is_open()) {
+        cerr << "Error: cannot open OpenCL kernel file: " << kernelPath << "\n";
+        return "";
+    }
+    std::string source((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    return source;
+}
+
+int main(int argc, char* argv[])
+{
+    //--------------------------------------------------------------------------
+    // 1) Parse Command Line: usage <device> <kernelPath> <n> <niters>
+    //--------------------------------------------------------------------------
+    if (argc < 5) {
+        cerr << "Usage: " << argv[0]
+             << " <device> <kernelPath> <n> <niters>\n";
+        return 1;
+    }
+
+    CmdLineArgs args;
+    args.device     = argv[1];          // e.g. "H100" or "max1550"
+    std::string kernelPath = argv[2];   // e.g. "kernels/gimmik/p3/hex/M0_opencl_bstream.cl"
+    args.n          = static_cast<size_t>(atoi(argv[3]));
+    args.niters     = atoi(argv[4]);
+
+    //--------------------------------------------------------------------------
+    // 2) From kernelPath => parse metadata, get .mtx path
+    //--------------------------------------------------------------------------
+    FileMetadata meta;
+    std::string mtxPath = kernelToMtxPath(kernelPath, meta);
+    meta.device = args.device;
+    if (mtxPath.empty()) {
+        cerr << "Error: unable to derive .mtx from kernel path: " << kernelPath << "\n";
+        return 1;
+    }
+
+    // Read matrix from .mtx
+    vector<double> A_data;
+    size_t m, k;
+    readMTXdense(mtxPath, A_data, m, k, meta);
+
+    // Prepare host B, C
+    vector<double> B_host(k * args.n, 1.0);
+    vector<double> C_host(m * args.n, 0.0);
+
+    //--------------------------------------------------------------------------
+    // 3) OpenCL initialization
+    //--------------------------------------------------------------------------
+    vector<cl::Platform> platforms;
+    cl::Platform::get(&platforms);
+    if (platforms.empty()) {
+        cerr << "No OpenCL platforms found.\n";
+        return 1;
+    }
+    // For simplicity, pick the first platform
+    cl::Platform platform = platforms[0];
+
+    // Get devices from that platform
+    vector<cl::Device> devices;
+    platform.getDevices(CL_DEVICE_TYPE_GPU, &devices);
+    if (devices.empty()) {
+        cerr << "No OpenCL GPU devices found.\n";
+        return 1;
+    }
+    cl::Device device = devices[0];
+
+    // Create context and command queue
+    cl::Context context(device);
+    cl::CommandQueue queue(context, device);
+
+    //--------------------------------------------------------------------------
+    // 4) Create OpenCL buffers
+    //--------------------------------------------------------------------------
+    size_t sizeB = B_host.size() * sizeof(double);
+    size_t sizeC = C_host.size() * sizeof(double);
+
+    // B = read-only, C = read-write
+    cl::Buffer dB(context, CL_MEM_READ_ONLY  | CL_MEM_COPY_HOST_PTR, sizeB, B_host.data());
+    cl::Buffer dC(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeC, C_host.data());
+
+    //--------------------------------------------------------------------------
+    // 5) Build OpenCL program from kernel source
+    //--------------------------------------------------------------------------
+    // We assume kernelPath points to a .cl file, e.g. "kernels/gimmik/p3/hex/M0_opencl_bstream.cl"
+    std::string kernelSource = readKernelSource(kernelPath);
+    if (kernelSource.empty()) {
+        cerr << "Error: kernel source from " << kernelPath << " is empty.\n";
+        return 1;
+    }
+
+    cl::Program::Sources sources;
+    sources.push_back({kernelSource.c_str(), kernelSource.size()});
+    cl::Program program(context, sources);
+
+    // Build with chosen compiler options
+    cl_int buildErr = program.build({device}, "-cl-std=CL1.2");
+    if (buildErr != CL_SUCCESS) {
+        std::string buildLog = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(device);
+        cerr << "OpenCL build error: " << buildErr << "\n";
+        cerr << "Build log:\n" << buildLog << "\n";
+        return 1;
+    }
+
+    // Create kernel (symbol name from the .cl file)
+    cl::Kernel gimmikKernel(program, "gimmik_mm");
+
+    //--------------------------------------------------------------------------
+    // 6) Set kernel arguments
+    //--------------------------------------------------------------------------
+    int n_int   = static_cast<int>(args.n);
+    int ldb_int = static_cast<int>(args.n);  // row-major => ldb = n
+    int ldc_int = static_cast<int>(args.n);  // row-major => ldc = n
+
+    gimmikKernel.setArg(0, n_int);
+    gimmikKernel.setArg(1, dB);
+    gimmikKernel.setArg(2, ldb_int);
+    gimmikKernel.setArg(3, dC);
+    gimmikKernel.setArg(4, ldc_int);
+
+    // The kernel might have __attribute__((reqd_work_group_size(64, 2, 1))) => local=(64,2)
+    // Adjust global sizes so dimension 0 covers 'n'
+    size_t localX = 64;
+    size_t localY = 2;
+    size_t globalX = ((args.n + localX - 1) / localX) * localX;
+    size_t globalY = 2;
+
+    //--------------------------------------------------------------------------
+    // 7) Warm-up kernel launch
+    //--------------------------------------------------------------------------
+    queue.enqueueNDRangeKernel(
+        gimmikKernel,
+        cl::NullRange,
+        cl::NDRange(globalX, globalY),
+        cl::NDRange(localX,  localY)
+    );
+    queue.finish();
+
+    //--------------------------------------------------------------------------
+    // 8) (No correctness check - purely OpenCL)
+    //--------------------------------------------------------------------------
+    // Skipped any CUDA/cublas checking.
+
+    //--------------------------------------------------------------------------
+    // 9) Timed loop
+    //--------------------------------------------------------------------------
+    auto start = high_resolution_clock::now();
+    for (int i = 0; i < args.niters; i++) {
+        queue.enqueueNDRangeKernel(
+            gimmikKernel,
+            cl::NullRange,
+            cl::NDRange(globalX, globalY),
+            cl::NDRange(localX, localY)
+        );
+    }
+    queue.finish();
+    auto end = high_resolution_clock::now();
+
+    double avg_sec = duration<double>(end - start).count() / args.niters;
+
+    //--------------------------------------------------------------------------
+    // 10) Print CSV output
+    //--------------------------------------------------------------------------
+    double eff = efficiency(meta, m, k, args.n, avg_sec);
+    writeOutputCSV(meta, args.n, avg_sec, eff);
+
+    //--------------------------------------------------------------------------
+    // 11) Done
+    //--------------------------------------------------------------------------
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/opencl/kernel_launch_cudacheck.cpp
+--------------------------------------------------------------------------------
+// Location: src/opencl/kernel_launch.cpp
+
+// Define Opencl 300
+#define CL_TARGET_OPENCL_VERSION 300
+
+#include "src/opencl/base.h"   // For kernelToMtxPath
+#include "src/base.h"          // readMTXdense, FileMetadata, etc.
+#include "src/cuda/base.h"     // checkCublasGemmCorrectness (if you want cuBLAS checking)
+#include <CL/cl.hpp>           // To access cl::Program, cl::Context, etc.
+#include <cublas_v2.h>         // For the correctness check
+#include <cuda_runtime.h>      // For reference correctness with cublas
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+
+using namespace std;
+using namespace std::chrono;
+
+/**
+ * \brief Read an OpenCL kernel source file and return its contents as a string.
+ */
+static std::string readKernelSource(const std::string &kernelPath)
+{
+    std::ifstream ifs(kernelPath);
+    if (!ifs.is_open()) {
+        cerr << "Error: cannot open OpenCL kernel file: " << kernelPath << "\n";
+        return "";
+    }
+    std::string source((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    return source;
+}
+
+int main(int argc, char* argv[])
+{
+    //--------------------------------------------------------------------------
+    // 1) Parse Command Line: usage <device> <kernelPath> <n> <niters>
+    //--------------------------------------------------------------------------
+    if (argc < 5) {
+        cerr << "Usage: " << argv[0]
+             << " <device> <kernelPath> <n> <niters>\n";
+        return 1;
+    }
+
+    CmdLineArgs args;
+    args.device       = argv[1];             // e.g. "H100"
+    std::string kernelPath = argv[2];        // e.g. "kernels/gimmik/p3/hex/M0_opencl_bstream.cpp"
+    args.n            = static_cast<size_t>(atoi(argv[3]));
+    args.niters       = atoi(argv[4]);
+
+    //--------------------------------------------------------------------------
+    // 2) From kernelPath => parse metadata, get .mtx path
+    //--------------------------------------------------------------------------
+    FileMetadata meta;
+    std::string mtxPath = kernelToMtxPath(kernelPath, meta);
+    meta.device = args.device;
+    if (mtxPath.empty()) {
+        cerr << "Error: unable to derive .mtx from kernel path: " << kernelPath << "\n";
+        return 1;
+    }
+
+    // Read matrix from .mtx
+    vector<double> A_data;
+    size_t m, k;
+    readMTXdense(mtxPath, A_data, m, k, meta);
+
+    // Prepare host B, C
+    vector<double> B_host(k * args.n, 1.0);
+    vector<double> C_host(m * args.n, 0.0);
+
+    //--------------------------------------------------------------------------
+    // 3) OpenCL initialization
+    //--------------------------------------------------------------------------
+    vector<cl::Platform> platforms;
+    cl::Platform::get(&platforms);
+    if (platforms.empty()) {
+        cerr << "No OpenCL platforms found.\n";
+        return 1;
+    }
+    // For simplicity, pick the first platform
+    cl::Platform platform = platforms[0];
+
+    // Get devices from that platform
+    vector<cl::Device> devices;
+    platform.getDevices(CL_DEVICE_TYPE_GPU, &devices);
+    if (devices.empty()) {
+        cerr << "No OpenCL GPU devices found.\n";
+        return 1;
+    }
+    cl::Device device = devices[0];
+
+    // Create context and queue
+    cl::Context context(device);
+    cl::CommandQueue queue(context, device);
+
+    //--------------------------------------------------------------------------
+    // 4) Create OpenCL buffers
+    //--------------------------------------------------------------------------
+    size_t sizeB = B_host.size() * sizeof(double);
+    size_t sizeC = C_host.size() * sizeof(double);
+
+    // B = read-only, C = read-write
+    cl::Buffer dB(context, CL_MEM_READ_ONLY  | CL_MEM_COPY_HOST_PTR, sizeB, B_host.data());
+    cl::Buffer dC(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeC, C_host.data());
+
+    //--------------------------------------------------------------------------
+    // 5) Build OpenCL program from kernel source
+    //--------------------------------------------------------------------------
+    std::string kernelSource = readKernelSource("kernels/gimmik/p3/hex/M0_opencl_bstream.cl");
+    if (kernelSource.empty()) {
+        cerr << "Error: kernel source from " << kernelPath << " is empty.\n";
+        return 1;
+    }
+
+    cl::Program::Sources sources;
+    sources.push_back({kernelSource.c_str(), kernelSource.size()});
+    cl::Program program(context, sources);
+
+    // Build with chosen compiler options
+    cl_int buildErr = program.build({device}, "-cl-std=CL1.2");
+    if (buildErr != CL_SUCCESS) {
+        std::string buildLog = program.getBuildInfo<CL_PROGRAM_BUILD_LOG>(device);
+        cerr << "OpenCL build error: " << buildErr << "\n";
+        cerr << "Build log:\n" << buildLog << "\n";
+        return 1;
+    }
+
+    // Create kernel (symbol name from the .cl or .cpp source)
+    cl::Kernel gimmikKernel(program, "gimmik_mm");
+
+    //--------------------------------------------------------------------------
+    // 6) Set kernel arguments
+    //--------------------------------------------------------------------------
+    int n_int   = static_cast<int>(args.n);
+    int ldb_int = static_cast<int>(args.n);  // row-major => ldb = n
+    int ldc_int = static_cast<int>(args.n);  // row-major => ldc = n
+
+    gimmikKernel.setArg(0, n_int);
+    gimmikKernel.setArg(1, dB);
+    gimmikKernel.setArg(2, ldb_int);
+    gimmikKernel.setArg(3, dC);
+    gimmikKernel.setArg(4, ldc_int);
+
+    // The kernel has __attribute__((reqd_work_group_size(64, 2, 1))) => local=(64,2)
+    size_t localX = 64, localY = 2;
+    size_t globalX = ((args.n + localX - 1) / localX) * localX;
+    size_t globalY = 2;
+
+    //--------------------------------------------------------------------------
+    // 7) Warm-up kernel launch
+    //--------------------------------------------------------------------------
+    queue.enqueueNDRangeKernel(
+        gimmikKernel,
+        cl::NullRange,
+        cl::NDRange(globalX, globalY),
+        cl::NDRange(localX,  localY)
+    );
+    queue.finish();
+
+    //--------------------------------------------------------------------------
+    // 8) Correctness check vs. cuBLAS
+    //--------------------------------------------------------------------------
+    {
+        // Create a cublas handle
+        cublasHandle_t blasHandle;
+        cublasCreate(&blasHandle);
+
+        // CUDA allocate for A, B, R
+        double* dA_cu = nullptr;
+        double* dB_cu = nullptr;
+        double* dR_cu = nullptr;
+        cudaAllocDouble(&dA_cu, A_data.size());
+        cudaAllocDouble(&dB_cu, B_host.size());
+        cudaAllocDouble(&dR_cu, C_host.size());
+
+        // Copy A, B from host to CUDA
+        cudaCopyToDevice(dA_cu, A_data, A_data.size());
+        cudaCopyToDevice(dB_cu, B_host, B_host.size());
+        cudaMemset(dR_cu, 0, C_host.size()*sizeof(double));
+
+        // Get the OpenCL result from dC => host => CUDA
+        vector<double> C_cl(m * args.n, 0.0);
+        queue.enqueueReadBuffer(dC, CL_TRUE, 0, sizeC, C_cl.data());
+
+        double* dC_cu = nullptr;
+        cudaAllocDouble(&dC_cu, C_cl.size());
+        cudaMemcpy(dC_cu, C_cl.data(), C_cl.size()*sizeof(double), cudaMemcpyHostToDevice);
+
+        // Check
+        bool ok = checkCublasGemmCorrectness(blasHandle,
+                                             m, args.n, k,
+                                             dA_cu, dB_cu, dC_cu,
+                                             1.0, 0.0, 1e-6);
+        if (!ok) {
+            cerr << "[Warm-up] OpenCL GiMMiK kernel mismatch vs cuBLAS reference.\n";
+            // Cleanup
+            cublasDestroy(blasHandle);
+            cudaFreeDouble(dA_cu);
+            cudaFreeDouble(dB_cu);
+            cudaFreeDouble(dR_cu);
+            cudaFreeDouble(dC_cu);
+            return 1;
+        }
+
+        // Cleanup
+        cublasDestroy(blasHandle);
+        cudaFreeDouble(dA_cu);
+        cudaFreeDouble(dB_cu);
+        cudaFreeDouble(dR_cu);
+        cudaFreeDouble(dC_cu);
+    }
+
+    //--------------------------------------------------------------------------
+    // 9) Timed loop
+    //--------------------------------------------------------------------------
+    auto start = high_resolution_clock::now();
+    for (int i = 0; i < args.niters; i++) {
+        queue.enqueueNDRangeKernel(
+            gimmikKernel,
+            cl::NullRange,
+            cl::NDRange(globalX, globalY),
+            cl::NDRange(localX, localY)
+        );
+    }
+    queue.finish();
+    auto end = high_resolution_clock::now();
+
+    double avg_sec = duration<double>(end - start).count() / args.niters;
+
+    //--------------------------------------------------------------------------
+    // 10) Print CSV output
+    //--------------------------------------------------------------------------
+    double eff = efficiency(meta, m, k, args.n, avg_sec);
+    writeOutputCSV(meta, args.n, avg_sec, eff);
+
+    //--------------------------------------------------------------------------
+    // 11) Done
+    //--------------------------------------------------------------------------
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/openmp/dense.cpp
+--------------------------------------------------------------------------------
+#include "src/common.h"  // contains parseFilename, readMTXMatrix, writeOutputCSV, etc.
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+using namespace std;
+using namespace chrono;
+
+// Minimal function to write a dense matrix in Matrix Market array format.
+// Uses column-major order to match readMTXMatrix in "dense" mode.
+static void writeMTXMatrix(const string &filename,
+                           const vector<double> &matrix,
+                           size_t rows, size_t cols)
+{
+    ofstream ofs(filename);
+    if (!ofs) {
+        cerr << "Cannot open output file: " << filename << endl;
+        exit(EXIT_FAILURE);
+    }
+    ofs << "%%MatrixMarket matrix array real general\n";
+    ofs << rows << " " << cols << "\n";
+
+    // Because readMTXMatrix() stores in column-major:
+    //   A_data[c * m + r] = val
+    for (size_t c = 0; c < cols; c++) {
+        for (size_t r = 0; r < rows; r++) {
+            ofs << matrix[c * rows + r] << "\n";
+        }
+    }
+    ofs.close();
+}
+
+// CPU-based matrix multiply: C = A × B
+//   A is (m × k), B is (k × n), C is (m × n), all in column-major.
+static void matMulCPU(const vector<double> &A,
+                      const vector<double> &B,
+                      vector<double> &C,
+                      size_t m, size_t k, size_t n)
+{
+    // For each column c of B,
+    //   for each row r of A,
+    //      sum across the k dimension
+    for (size_t c = 0; c < n; c++) {
+        for (size_t r = 0; r < m; r++) {
+            double sum = 0.0;
+            for (size_t kk = 0; kk < k; kk++) {
+                sum += A[kk * m + r] * B[c * k + kk];
+            }
+            C[c * m + r] = sum;
+        }
+    }
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 8) {
+        cerr << "Usage: " << argv[0]
+             << " <A-mtx-file> <n> <iterations> <vendor> <device> <B-out-file> <C-out-file>\n";
+        return 1;
+    }
+
+    // 1) Parse arguments
+    string A_mtx = argv[1];
+    size_t n = static_cast<size_t>(atoi(argv[2]));
+    int iterations = atoi(argv[3]);
+    string vendor = argv[4];
+    string device = argv[5];
+    string B_outfile = argv[6];
+    string C_outfile = argv[7];
+
+    // 2) Parse file metadata (order, etype, etc.)
+    FileMetadata meta = parseFilename(A_mtx);
+
+    // 3) Read A (m × k) from .mtx
+    vector<double> A_data;
+    size_t m, k;
+    readMTXMatrix(A_mtx, A_data, m, k, meta);
+    cout << "\nRead A: dimension " << m << " x " << k << " ("
+         << (meta.sparsity == "sp" ? "sparse" : "dense") << ")\n";
+
+    // 4) Create B (k × n) with a fixed random seed, or all ones if desired.
+    //    Here we do random for demonstration.
+    srand(1235);
+    vector<double> B_data(k * n);
+    for (size_t i = 0; i < k * n; i++) {
+        B_data[i] = static_cast<double>(rand()) / RAND_MAX;
+    }
+
+    // 5) Store B in .mtx
+    writeMTXMatrix(B_outfile, B_data, k, n);
+    cout << "Wrote B: dimension " << k << " x " << n
+         << " to " << B_outfile << endl;
+
+    // 6) Prepare C (m × n) for the product
+    vector<double> C_data(m * n, 0.0);
+
+    // 7) Warm-up multiply once (optional)
+    matMulCPU(A_data, B_data, C_data, m, k, n);
+
+    // 8) Time multiple iterations of matMulCPU
+    auto start = high_resolution_clock::now();
+    for (int i = 0; i < iterations; i++) {
+        matMulCPU(A_data, B_data, C_data, m, k, n);
+    }
+    auto end = high_resolution_clock::now();
+    double total_s = duration<double>(end - start).count();
+    double avg_s = total_s / iterations;
+    cout << "CPU Multiply time: " << total_s << "s over "
+         << iterations << " iterations => " << avg_s << " s/iter\n";
+
+    // 9) Store C in .mtx
+    writeMTXMatrix(C_outfile, C_data, m, n);
+    cout << "Wrote C: dimension " << m << " x " << n
+         << " to " << C_outfile << endl;
+
+    // 10) (Optional) Write CSV performance info
+    //     We can reuse your existing function if you want it consistent.
+    //     This calculates metrics using meta.nnz if the matrix was sparse, etc.
+    writeOutputCSV(meta, n, m, k, iterations, avg_s, vendor, device);
+
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/sycl/base.cpp
+--------------------------------------------------------------------------------
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/sycl/base.h
+--------------------------------------------------------------------------------
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/sycl/dense.cpp
+--------------------------------------------------------------------------------
+#include <CL/sycl.hpp>
+#include <oneapi/mkl.hpp>
+#include "common.h"
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cstdlib>
+
+using namespace std;
+using namespace sycl;
+using namespace oneapi;
+
+int main(int argc, char* argv[]) {
+    FileMetadata meta = parseFilename(argv[1]);
+    size_t n = (argc >= 3) ? atoi(argv[2]) : 0;
+    int iterations = atoi(argv[3]);
+    string vendor = argv[4];
+    string device = argv[5];    
+
+    vector<double> A_data;
+    size_t m, k;
+    readMTXMatrix(argv[1], A_data, m, k, meta);
+    if(n == 0)
+        n = k;
+    
+    vector<double> B_data(k * n, 1.0);
+    vector<double> C_data(m * n, 0.0);
+    
+    // Create SYCL queue on a GPU device.
+    queue q{gpu_selector_v};
+    
+    // Create SYCL buffers.
+    buffer<double, 1> bufA(A_data.data(), range<1>(A_data.size()));
+    buffer<double, 1> bufB(B_data.data(), range<1>(B_data.size()));
+    buffer<double, 1> bufC(C_data.data(), range<1>(C_data.size()));
+    
+    double alpha = 1.0, beta = 0.0;
+    
+    try {
+        //   d_C = alpha *   d_A  *  d_B  + beta *  d_C
+        // m x n =          m x k * k x n +        m x n
+
+        mkl::blas::gemm(q,
+            mkl::transpose::nontrans, mkl::transpose::nontrans,
+            m, n, k, 
+            alpha, bufA, m,
+            bufB, k,
+            beta, bufC, m);
+        q.wait_and_throw();
+    } catch (const sycl::exception& e) {
+        cerr << "GEMM warm-up exception: " << e.what() << "\n";
+        return 1;
+    }
+    
+    auto start_time = chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; i++) {
+        //   d_C = alpha *   d_A  *  d_B  + beta *  d_C
+        // m x n =          m x k * k x n +        m x n
+        mkl::blas::gemm(q,
+            mkl::transpose::nontrans, mkl::transpose::nontrans,
+            m, n, k, 
+            alpha, bufA, m,
+            bufB, k,
+            beta, bufC, m);
+    }
+    q.wait_and_throw();
+    auto end_time = chrono::high_resolution_clock::now();
+    double total = chrono::duration<double>(end_time - start_time).count();
+    double avg = total / iterations;
+    
+    writeOutputCSV(meta, n, m, k, iterations, avg, vendor, device);
+    
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________
+________________________________________________________________________________
+File-name: src/sycl/kernel_launch_sycl.cpp
+--------------------------------------------------------------------------------
+#include <CL/sycl.hpp>
+#include "src/common.h"      // Your helper routines and FileMetadata
+#include "kernels/manual/sycl/p3/hex/gimmik_mm.hpp" // Declaration for gimmik_mm(...)
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <cstdlib>
+
+using namespace std;
+using namespace sycl;
+
+// Launch wrapper that does a warm-up and then times the kernel calls
+double launch_gimmik_mm(queue &q, int m, int k, int n, const double *d_B, double *d_C, int iterations)
+{
+    // For a simple one-row kernel, we typically use these leading dims:
+    int ldb = n;
+    int ldc = n;
+
+    // Warm-up launch
+    gimmik_mm(q, n, d_B, ldb, d_C, ldc);
+    q.wait(); // wait for warm-up to complete
+
+    // Timed loop
+    auto start = chrono::high_resolution_clock::now();
+    for(int i = 0; i < iterations; i++) {
+        gimmik_mm(q, n, d_B, ldb, d_C, ldc);
+    }
+    q.wait(); // Ensure all kernels have finished
+    auto end = chrono::high_resolution_clock::now();
+
+    double total = chrono::duration<double>(end - start).count();
+    double avg   = total / iterations;
+
+    cout << "\nTime taken: " << total << " s\n";
+    return avg;
+}
+
+int main(int argc, char* argv[])
+{
+    // Parse input arguments
+    if(argc < 6) {
+        cerr << "Usage: " << argv[0] << " <m> <k> <n> <iterations> <device>\n";
+        return 1;
+    }
+    // FileMetadata meta = parseFilename(argv[1]);
+    size_t m          = atoi(argv[1]);   // for the A, C dimensions
+    size_t k          = atoi(argv[2]);   // for the A, B dimensions
+    size_t n          = atoi(argv[3]);   // for the B, C dimensions
+    int iterations    = atoi(argv[4]);
+    string device     = argv[5];
+
+    // Read the matrix from .mtx to figure out (m, k). We do not actually use
+    // A_data for the kernel, but we parse to fill metadata (like meta.nnz).
+    // vector<double> A_data; 
+    // size_t m, k;
+    // readMTXMatrix(argv[1], A_data, m, k, meta);
+
+    // Prepare host-side buffers for B (k x n) and C (m x n).
+    vector<double> B_data(k*n, 1.0);  // fill with 1.0
+    vector<double> C_data(m*n, 0.0);  // fill with 0.0
+
+    // Create a SYCL queue targeting a GPU
+    queue q{gpu_selector{}};
+
+    // Allocate device memory with USM device allocations
+    double *d_B = malloc_device<double>(B_data.size(), q);
+    double *d_C = malloc_device<double>(C_data.size(), q);
+
+    // Copy data from host to device
+    q.memcpy(d_B, B_data.data(), B_data.size() * sizeof(double)).wait();
+    q.memcpy(d_C, C_data.data(), C_data.size() * sizeof(double)).wait();
+
+    // Launch and measure time
+    double avg_sec = launch_gimmik_mm(q, m, k, n, d_B, d_C, iterations);
+
+    // (Optional) Copy back results if you want to verify correctness
+    // q.memcpy(C_data.data(), d_C, C_data.size() * sizeof(double)).wait();
+    // for (size_t i = 0; i < m*n; i++) { ... }
+
+    // Write CSV log
+    // writeOutputCSV(meta, n, m, k, iterations, avg_sec, vendor, device);
+
+    // Free device memory
+    sycl::free(d_B, q);
+    sycl::free(d_C, q);
+
+    return 0;
+}
+________________________________________________________________________________
+________________________________________________________________________________

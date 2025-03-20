@@ -8,6 +8,12 @@
 #include <cmath>
 #include <cstdlib>
 
+
+// Add these two lines if not already present:
+#include <string>
+#include <sstream>
+
+
 #include "src/base.h"         // parseCmdLineArgs, readMTXdense, etc.
 #include "src/cuda/base.h"    // cudaAllocDouble, cudaCopyToDevice, cudaCopyToHost, etc.
 
@@ -21,61 +27,82 @@ extern __global__ void gimmik_mm(int n,
                                  double* __restrict__ c, int ldc);
 
 /**
- * \brief Parse the kernel path, e.g. "kernels/gimmik/cuda/p3/hex/M0.cpp"
- *        to build a matching .mtx path "operators/p3/hex/M0.mtx".
- *        Similar to parseFilename, but we parse from kernel path.
+ * \brief Parse the kernel path, e.g. 
+ *        "kernels/gimmik/cuda/p1/hex/M0_bstream.cpp"
+ *        now that your directory structure is:
+ *          kernels/gimmik/<backend>/<pX>/<etype>/<AMatName>_<pattern>.cpp
  *
- * \param kernelPath (in) path to the GiMMiK kernel .cpp file
- * \param meta       (out) partially filled FileMetadata (order, etype, AMatName, mmtype)
- * \return           the derived .mtx path, e.g. "operators/p3/hex/M0.mtx"
+ * \param kernelPath (in) the path to the GiMMiK kernel .cpp file, 
+ *        e.g. "kernels/gimmik/cuda/p1/hex/M0_bstream.cpp"
+ * \param meta       (out) partially filled FileMetadata 
+ *                   (order, etype, AMatName, backend, mmtype)
+ * \return           the derived .mtx path, e.g. "operators/p1/hex/M0.mtx"
  */
 std::string kernelToMtxPath(const std::string &kernelPath, FileMetadata &meta)
 {
-    // Example: kernelPath = "kernels/gimmik/cuda/p3/hex/M0_bstream.cpp"
-    // 1) Find "kernels/gimmik/p"
-    size_t pos = kernelPath.find("kernels/gimmik/p");
+    // 1) Find the prefix "kernels/gimmik/" in kernelPath
+    const std::string prefix = "kernels/gimmik/";
+    size_t pos = kernelPath.find(prefix);
     if (pos == std::string::npos) {
-        // Fallback if not found
+        // If not found, we cannot parse it
         return "";
     }
+
     // Advance past "kernels/gimmik/"
-    pos += std::string("kernels/gimmik/").size();
+    pos += prefix.size();
+    // sub => e.g. "cuda/p1/hex/M0_bstream.cpp"
+    std::string sub = kernelPath.substr(pos);
 
-    // Next char => polynomial order, e.g. "3"
-    // So "p3" => we skip 'p'
-    pos++; // skip 'p'
-    meta.order = kernelPath.substr(pos, 1);
+    // 2) Split 'sub' on '/' to get tokens:
+    //    tokens[0] = "cuda"       (the backend)
+    //    tokens[1] = "p1"         (polynomial order)
+    //    tokens[2] = "hex"        (element type)
+    //    tokens[3] = "M0_bstream.cpp"
+    std::vector<std::string> tokens;
+    {
+        std::stringstream ss(sub);
+        std::string part;
+        while (std::getline(ss, part, '/'))
+            tokens.push_back(part);
+    }
+    if (tokens.size() < 4) {
+        // Must at least have [backend, pX, etype, filename]
+        return "";
+    }
 
-    // Next slash => e.g. "...p3/hex..."
-    size_t slashPos = kernelPath.find('/', pos);
-    // Extract up to 3 letters for etype, e.g. "hex"
-    meta.etype = kernelPath.substr(slashPos + 1, 3);
+    // 3) Parse the tokens into meta fields
+    meta.backend = tokens[0];  // e.g. "cuda"
 
-    // Final filename => e.g. "M0_bstream.cpp"
-    std::string fname = kernelPath.substr(kernelPath.find_last_of('/') + 1);
-    // Remove ".cpp"
+    // tokens[1] => e.g. "p1", skip 'p'
+    // If tokens[1] = "p1", meta.order => "1"
+    if (tokens[1].size() < 2 || tokens[1][0] != 'p') {
+        // Something unexpected
+        return "";
+    }
+    meta.order = tokens[1].substr(1);   // after 'p', e.g. "1"
+
+    meta.etype = tokens[2];  // e.g. "hex"
+
+    // Now parse filename => "M0_bstream.cpp" => remove ".cpp" => "M0_bstream"
+    std::string fname = tokens[3];
     size_t dotPos = fname.rfind(".cpp");
-    std::string baseName = (dotPos != std::string::npos)
-                           ? fname.substr(0, dotPos)
-                           : fname;
+    if (dotPos != std::string::npos) {
+        fname = fname.substr(0, dotPos);
+    }
 
-    // There will always be three words separated by underscore
-    // e.g. "M0_cuda_bstream-ksplit" => AMatName="M0", backend="cuda", mmtype="bstream-ksplit"
-    // THIS IS ALWAYS THE TEMPLATE.
-    meta.AMatName = baseName.substr(0, baseName.find('_'));
-    meta.backend = baseName.substr(baseName.find('_') + 1, baseName.rfind('_') - baseName.find('_') - 1);
-    meta.mmtype = baseName.substr(baseName.rfind('_') + 1);
+    // Expect something like "M0_bstream" => split at underscore
+    //   => M0  +  bstream
+    size_t underscorePos = fname.find('_');
+    if (underscorePos == std::string::npos) {
+        return "";
+    }
+    meta.AMatName = fname.substr(0, underscorePos);       // e.g. "M0"
+    std::string mmtypePart = fname.substr(underscorePos + 1); // e.g. "bstream"
 
-    // Prefix meta.mmtype with gimmik_
-    meta.mmtype = "gimmik_" + meta.mmtype;
+    // 4) Set mmtype in meta: prefix "gimmik_"
+    meta.mmtype = "gimmik_" + mmtypePart;
 
-    
-
-    // meta.mmtype   = baseName.substr(underscorePos + 1);
-
-
-    // Build .mtx path => e.g. "operators/p3/hex/M0.mtx"
-    //     where meta.order = "3", meta.etype = "hex", meta.AMatName = "M0"
+    // 5) Build the .mtx path => e.g. "operators/p1/hex/M0.mtx"
     std::string mtxPath = "operators/p" + meta.order + "/" + meta.etype
                           + "/" + meta.AMatName + ".mtx";
     return mtxPath;
@@ -139,7 +166,9 @@ int main(int argc, char* argv[])
     cudaCopyToDevice(dB, B_host, B_host.size());
     cudaCopyToDevice(dC, C_host, C_host.size());
 
-    // Note: Matrix A is baked in, Use A_data to verify correctness with cuBLAS.
+    // Note: The GiMMiK kernel presumably has matrix A baked in,
+    //       so we do not need a device copy of A for the kernel itself.
+    //       We only use A_data if we want to verify correctness with cuBLAS.
 
     // -------------------------------------------------------------------------
     // 5. Create block/grid dimensions and do a warm-up kernel launch
@@ -148,9 +177,8 @@ int main(int argc, char* argv[])
     int gridSize  = (static_cast<int>(args.n) + blockSize - 1) / blockSize;
 
     // We pass n as the leading dimension in a row-major interpretation:
-    //   B: shape (k x n), but the kernel expects B as [row i, col j].
-    //   Treat B row-major => ldb = n. 
-    //   Treat C row-major => ldc = n.
+    //   B has shape (k x n), but the kernel expects B as [row i, col j].
+    //   We effectively treat B row-major => ldb = n. Same for C => ldc = n.
     int ldb = static_cast<int>(args.n);
     int ldc = static_cast<int>(args.n);
 
@@ -238,6 +266,8 @@ int main(int argc, char* argv[])
     // For example, in kernels/gimmik/p3/hex/M0_cuda_bstream.cpp the name is bstream, which is the last part after underscore
     // We use the last part of the kernel path as the backend name.
     // e.g. "bstream"
+
+    
     
     writeOutputCSV(meta, args.n, avg, efficiency(meta, m, k, args.n, avg));
 
